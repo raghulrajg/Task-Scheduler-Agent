@@ -1,0 +1,32 @@
+{
+  "robots": [
+    {
+      "id": "robot_01",
+      "name": "UR5e_Arm_1",
+      "type": "manipulator",
+      "manipulator": true,
+      "dof": 6,
+      "capabilities": ["pick", "place"],
+      "zones": ["manufacturing_1", "package_area", "waste_area"],
+      "status": "idle"
+    },
+    {
+      "id": "robot_02",
+      "name": "MobileBase_1",
+      "type": "amr",
+      "manipulator": false,
+      "capabilities": ["navigate", "transport"],
+      "zones": ["*"],
+      "status": "idle"
+    },
+    {
+      "id": "robot_03",
+      "name": "QualityScanner_1",
+      "type": "vision_station",
+      "manipulator": false,
+      "capabilities": ["quality_check"],
+      "zones": ["quality_station"],
+      "status": "idle"
+    }
+  ]
+}
