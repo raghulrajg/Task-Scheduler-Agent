@@ -33,8 +33,10 @@ logger = logging.getLogger("scheduler_node")
 
 REASONING_AGENT_TOPIC = "robot_task_queue"   # <-- confirm/rename to match agent_llm_node's publisher
 ROBOT_METADATA_PATH = "robots_metadata.json"
-MQTT_BROKER_HOST = "localhost"
+MQTT_BROKER_HOST = "172.25.200.57"
 MQTT_BROKER_PORT = 1883
+MQTT_USERNAME = "raghulrajg"
+MQTT_PASSWORD = "Gr2_nemam"
 
 
 class SchedulerNode(Node):
@@ -46,6 +48,8 @@ class SchedulerNode(Node):
             broker_host=MQTT_BROKER_HOST,
             broker_port=MQTT_BROKER_PORT,
             client_id="task_scheduler_node",
+            username=MQTT_USERNAME,
+            password=MQTT_PASSWORD,
             on_status=self._on_robot_status,
         )
         self.scheduler = TaskScheduler(self.registry, self.mqtt_client)
@@ -67,9 +71,9 @@ class SchedulerNode(Node):
         task_id = self.scheduler.submit_instruction(instruction)
         self.get_logger().info(f"Submitted task {task_id}: {instruction}")
 
-    def _on_robot_status(self, robot_id: str, payload: dict):
+    def _on_robot_status(self, robot_id: str, subsystem: str, payload: dict):
         # bridge MQTT callback (runs on paho's thread) into the scheduler
-        self.scheduler.on_robot_status(robot_id, payload)
+        self.scheduler.on_robot_status(robot_id, subsystem, payload)
 
     def destroy_node(self):
         self.mqtt_client.disconnect()

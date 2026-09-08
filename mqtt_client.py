@@ -1,9 +1,19 @@
 """
 mqtt_client.py
 --------------
-Thin wrapper around paho-mqtt. Publishes tasks to `robots/<robot_id>/task`
-and listens on `robots/+/status` for completion/failure acks, which is how
-the scheduler advances a multi-step, multi-robot task graph.
+Thin wrapper around paho-mqtt. Each physical robot has its own MQTT
+namespace, and each subsystem within that robot has its own sub-topic under
+that namespace, matching your controllers being separate per subsystem:
+
+    robots/<robot_id>/<subsystem>/task     (scheduler -> robot, scheduler publishes)
+    robots/<robot_id>/<subsystem>/status   (robot -> scheduler, robot publishes)
+
+e.g. robots/robot_01/amr/task, robots/robot_01/arm/task,
+     robots/qc_01/scanner/task
+
+The scheduler subscribes to the wildcard robots/+/+/status so any
+subsystem's controller can report completion without the scheduler needing
+to know every topic name up front.
 
 Install: pip install paho-mqtt --break-system-packages
 """
@@ -14,24 +24,27 @@ from typing import Callable, Optional
 
 logger = logging.getLogger("mqtt_client")
 
-TASK_TOPIC_TEMPLATE = "robots/{robot_id}/task"
-STATUS_TOPIC_WILDCARD = "robots/+/status"
-STATUS_TOPIC_TEMPLATE = "robots/{robot_id}/status"
+TASK_TOPIC_TEMPLATE = "robots/{robot_id}/{subsystem}/task"
+STATUS_TOPIC_WILDCARD = "robots/+/+/status"
 
 
 class SchedulerMQTTClient:
     def __init__(self, broker_host: str = "localhost", broker_port: int = 1883,
                  client_id: str = "task_scheduler",
-                 on_status: Optional[Callable[[str, dict], None]] = None):
+                 username: Optional[str] = None, password: Optional[str] = None,
+                 on_status: Optional[Callable[[str, str, dict], None]] = None):
         """
-        on_status: callback(robot_id, payload_dict) invoked whenever a robot
-        publishes on robots/<id>/status. payload_dict is expected to look like
-        {"subtask_id": "...", "state": "done"|"failed", "result": {...}}
+        on_status: callback(robot_id, subsystem, payload_dict) invoked whenever
+        a robot subsystem publishes on robots/<id>/<subsystem>/status.
+        payload_dict looks like {"subtask_id": "...", "state": "done"|"failed",
+        "result": {...}}
         """
         import paho.mqtt.client as mqtt  # imported lazily so this module can be
                                           # imported (e.g. for type hints/tests)
                                           # on machines without paho-mqtt installed
         self._client = mqtt.Client(client_id=client_id, clean_session=True)
+        if username:
+            self._client.username_pw_set(username, password)
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
         self._on_status = on_status
@@ -57,15 +70,15 @@ class SchedulerMQTTClient:
             logger.warning("Ignoring non-JSON message on %s", msg.topic)
             return
 
-        # topic shape: robots/<robot_id>/status
+        # topic shape: robots/<robot_id>/<subsystem>/status
         parts = msg.topic.split("/")
-        if len(parts) == 3 and parts[0] == "robots" and parts[2] == "status":
-            robot_id = parts[1]
+        if len(parts) == 4 and parts[0] == "robots" and parts[3] == "status":
+            robot_id, subsystem = parts[1], parts[2]
             if self._on_status:
-                self._on_status(robot_id, payload)
+                self._on_status(robot_id, subsystem, payload)
 
-    def publish_task(self, robot_id: str, subtask: dict, qos: int = 1):
-        topic = TASK_TOPIC_TEMPLATE.format(robot_id=robot_id)
+    def publish_task(self, robot_id: str, subsystem: str, subtask: dict, qos: int = 1):
+        topic = TASK_TOPIC_TEMPLATE.format(robot_id=robot_id, subsystem=subsystem)
         payload = json.dumps(subtask)
         logger.info("Publishing to %s: %s", topic, payload)
         self._client.publish(topic, payload, qos=qos)

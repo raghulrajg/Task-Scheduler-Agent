@@ -2,31 +2,67 @@
   "robots": [
     {
       "id": "robot_01",
-      "name": "UR5e_Arm_1",
-      "type": "manipulator",
-      "manipulator": true,
-      "dof": 6,
-      "capabilities": ["pick", "place"],
-      "zones": ["manufacturing_1", "package_area", "waste_area"],
-      "status": "idle"
+      "name": "MobileManipulator_1",
+      "type": "mobile_manipulator",
+      "status": "idle",
+      "zones": ["*"],
+      "subsystems": {
+        "amr": { "topic": "amr", "capabilities": ["navigate", "transport"] },
+        "arm": { "topic": "arm", "capabilities": ["pick", "place"], "manipulator": true, "dof": 6 }
+      }
     },
     {
       "id": "robot_02",
-      "name": "MobileBase_1",
-      "type": "amr",
-      "manipulator": false,
-      "capabilities": ["navigate", "transport"],
+      "name": "MobileManipulator_2",
+      "type": "mobile_manipulator",
+      "status": "idle",
       "zones": ["*"],
-      "status": "idle"
+      "subsystems": {
+        "amr": { "topic": "amr", "capabilities": ["navigate", "transport"] },
+        "arm": { "topic": "arm", "capabilities": ["pick", "place"], "manipulator": true, "dof": 6 }
+      }
     },
     {
       "id": "robot_03",
+      "name": "MobileManipulator_3",
+      "type": "mobile_manipulator",
+      "status": "idle",
+      "zones": ["*"],
+      "subsystems": {
+        "amr": { "topic": "amr", "capabilities": ["navigate", "transport"] },
+        "arm": { "topic": "arm", "capabilities": ["pick", "place"], "manipulator": true, "dof": 6 }
+      }
+    },
+    {
+      "id": "robot_04",
+      "name": "MobileManipulator_4",
+      "type": "mobile_manipulator",
+      "status": "idle",
+      "zones": ["*"],
+      "subsystems": {
+        "amr": { "topic": "amr", "capabilities": ["navigate", "transport"] },
+        "arm": { "topic": "arm", "capabilities": ["pick", "place"], "manipulator": true, "dof": 6 }
+      }
+    },
+    {
+      "id": "qc_01",
       "name": "QualityScanner_1",
       "type": "vision_station",
-      "manipulator": false,
-      "capabilities": ["quality_check"],
+      "status": "idle",
       "zones": ["quality_station"],
-      "status": "idle"
+      "subsystems": {
+        "scanner": { "topic": "scanner", "capabilities": ["quality_check"] }
+      }
+    },
+    {
+      "id": "qc_02",
+      "name": "QualityScanner_2",
+      "type": "vision_station",
+      "status": "idle",
+      "zones": ["quality_station"],
+      "subsystems": {
+        "scanner": { "topic": "scanner", "capabilities": ["quality_check"] }
+      }
     }
   ]
 }

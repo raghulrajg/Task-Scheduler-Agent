@@ -1,18 +1,27 @@
 """
 robot_registry.py
 ------------------
-Loads robot fleet metadata (id, name, capabilities, manipulator flag, zones,
-status) and exposes query helpers the allocator uses to pick a robot for a
-given subtask.
+Loads robot fleet metadata and exposes the query/claim helpers the scheduler
+uses. Each entry in robots_metadata.json is ONE PHYSICAL ROBOT, which may
+have multiple SUBSYSTEMS with independent controllers/topics (e.g. an AMR
+base and a 6-DOF arm mounted on it). The robot as a whole is what gets
+locked idle/busy -- the AMR and arm on the same physical unit can't be
+double-booked by two different jobs even though they have separate topics,
+because moving the base and using the arm both belong to whichever task
+currently "owns" that robot.
 
-Metadata source is a JSON file so it can be edited/extended without touching
-code, and reloaded at runtime if the fleet changes.
+Concurrency: find_candidates() + claiming used to be two separate calls in
+an earlier version, which is a race condition -- two threads could both see
+the same robot as idle before either marked it busy. try_claim() below does
+the search-and-mark-busy as a single atomic operation under one lock, which
+is what makes it safe for multiple instructions to be submitted to the
+scheduler at the same time.
 """
 
 import json
 import threading
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 
 @dataclass
@@ -20,13 +29,20 @@ class Robot:
     id: str
     name: str
     type: str
-    manipulator: bool
-    capabilities: List[str]
+    subsystems: Dict[str, Dict[str, Any]]  # subsystem_key -> {topic, capabilities, manipulator?}
     zones: List[str] = field(default_factory=lambda: ["*"])
     status: str = "idle"  # idle | busy | offline | error
 
     def has_capability(self, capability: str) -> bool:
-        return capability in self.capabilities
+        return any(capability in sub.get("capabilities", []) for sub in self.subsystems.values())
+
+    def manipulator_matches(self, require_manipulator: Optional[bool], capability: str) -> bool:
+        if require_manipulator is None:
+            return True
+        for sub in self.subsystems.values():
+            if capability in sub.get("capabilities", []):
+                return sub.get("manipulator", False) == require_manipulator
+        return False
 
     def can_operate_in(self, zone: Optional[str]) -> bool:
         if zone is None or "*" in self.zones:
@@ -36,6 +52,14 @@ class Robot:
     def is_available(self) -> bool:
         return self.status == "idle"
 
+    def subsystem_for_capability(self, capability: str) -> Optional[str]:
+        """Returns the MQTT topic segment for whichever subsystem provides this
+        capability, e.g. 'arm' for 'pick', 'amr' for 'navigate'."""
+        for sub in self.subsystems.values():
+            if capability in sub.get("capabilities", []):
+                return sub["topic"]
+        return None
+
 
 class RobotRegistry:
     """Thread-safe in-memory registry of robots, backed by a JSON file."""
@@ -43,7 +67,7 @@ class RobotRegistry:
     def __init__(self, metadata_path: str):
         self._path = metadata_path
         self._lock = threading.Lock()
-        self._robots = {}
+        self._robots: Dict[str, Robot] = {}
         self.reload()
 
     def reload(self):
@@ -55,8 +79,7 @@ class RobotRegistry:
                     id=r["id"],
                     name=r["name"],
                     type=r.get("type", "generic"),
-                    manipulator=r.get("manipulator", False),
-                    capabilities=r.get("capabilities", []),
+                    subsystems=r.get("subsystems", {}),
                     zones=r.get("zones", ["*"]),
                     status=r.get("status", "idle"),
                 )
@@ -71,34 +94,52 @@ class RobotRegistry:
         with self._lock:
             return self._robots.get(robot_id)
 
-    def find_candidates(self, required_capabilities: List[str],
-                         zone: Optional[str] = None,
-                         require_manipulator: Optional[bool] = None) -> List[Robot]:
-        """Return idle robots that satisfy all required capabilities,
-        the target zone, and the manipulator requirement (if specified)."""
+    def subsystem_topic(self, robot_id: str, capability: str) -> Optional[str]:
         with self._lock:
-            robots = list(self._robots.values())
+            robot = self._robots.get(robot_id)
+            return robot.subsystem_for_capability(capability) if robot else None
 
-        candidates = []
-        for r in robots:
-            if not r.is_available():
-                continue
-            if not all(r.has_capability(c) for c in required_capabilities):
-                continue
-            if not r.can_operate_in(zone):
-                continue
-            if require_manipulator is not None and r.manipulator != require_manipulator:
-                continue
-            candidates.append(r)
-        return candidates
+    def _matches(self, robot: Robot, required_capabilities: List[str],
+                 zone: Optional[str], require_manipulator: Optional[bool]) -> bool:
+        if not robot.is_available():
+            return False
+        if not all(robot.has_capability(c) for c in required_capabilities):
+            return False
+        if not robot.can_operate_in(zone):
+            return False
+        if require_manipulator is not None:
+            if not all(robot.manipulator_matches(require_manipulator, c) for c in required_capabilities):
+                return False
+        return True
+
+    def try_claim(self, required_capabilities: List[str],
+                   zone: Optional[str] = None,
+                   require_manipulator: Optional[bool] = None) -> Optional[Robot]:
+        """Atomically find an idle, capable robot and mark it busy in one step.
+        Returns None if nothing currently qualifies (caller should treat this
+        as 'try again later', not a hard failure)."""
+        with self._lock:
+            for robot in self._robots.values():
+                if self._matches(robot, required_capabilities, zone, require_manipulator):
+                    robot.status = "busy"
+                    return robot
+        return None
+
+    def try_claim_specific(self, robot_id: str) -> Optional[Robot]:
+        """Atomically claim a SPECIFIC robot (used when a task must keep using
+        the same physical robot for its next step). Returns None if that
+        robot is not idle right now."""
+        with self._lock:
+            robot = self._robots.get(robot_id)
+            if robot and robot.is_available():
+                robot.status = "busy"
+                return robot
+        return None
 
     def set_status(self, robot_id: str, status: str):
         with self._lock:
             if robot_id in self._robots:
                 self._robots[robot_id].status = status
-
-    def mark_busy(self, robot_id: str):
-        self.set_status(robot_id, "busy")
 
     def mark_idle(self, robot_id: str):
         self.set_status(robot_id, "idle")
