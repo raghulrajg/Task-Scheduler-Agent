@@ -1,0 +1,20 @@
+# Example systemd unit for the scheduler process.
+# Install: sudo cp deploy/task-scheduler.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable --now task-scheduler
+[Unit]
+Description=Task planning and scheduling agent (MQTT dispatcher)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sam
+WorkingDirectory=/home/sam/task_scheduler_pkg
+EnvironmentFile=/home/sam/task_scheduler_pkg/.env
+ExecStart=/usr/bin/python3 /home/sam/task_scheduler_pkg/scheduler_service.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

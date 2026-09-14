@@ -1,19 +1,16 @@
 """
 mqtt_client.py
 --------------
-Thin wrapper around paho-mqtt. Each physical robot has its own MQTT
-namespace, and each subsystem within that robot has its own sub-topic under
-that namespace, matching your controllers being separate per subsystem:
+Thin wrapper around paho-mqtt. This is now the ONLY transport in the system
+-- no ROS2, no rclpy. One MQTT client on the scheduler side subscribes to
+two things:
 
-    robots/<robot_id>/<subsystem>/task     (scheduler -> robot, scheduler publishes)
-    robots/<robot_id>/<subsystem>/status   (robot -> scheduler, robot publishes)
+    scheduler/instructions          reasoning agent -> scheduler (new task)
+    robots/+/+/status                robot subsystem -> scheduler (task ack)
 
-e.g. robots/robot_01/amr/task, robots/robot_01/arm/task,
-     robots/qc_01/scanner/task
+and publishes to:
 
-The scheduler subscribes to the wildcard robots/+/+/status so any
-subsystem's controller can report completion without the scheduler needing
-to know every topic name up front.
+    robots/<robot_id>/<subsystem>/task   scheduler -> robot subsystem
 
 Install: pip install paho-mqtt --break-system-packages
 """
@@ -21,6 +18,8 @@ Install: pip install paho-mqtt --break-system-packages
 import json
 import logging
 from typing import Callable, Optional
+
+import config
 
 logger = logging.getLogger("mqtt_client")
 
@@ -32,12 +31,17 @@ class SchedulerMQTTClient:
     def __init__(self, broker_host: str = "localhost", broker_port: int = 1883,
                  client_id: str = "task_scheduler",
                  username: Optional[str] = None, password: Optional[str] = None,
-                 on_status: Optional[Callable[[str, str, dict], None]] = None):
+                 on_status: Optional[Callable[[str, str, dict], None]] = None,
+                 on_instruction: Optional[Callable[[dict], None]] = None,
+                 instruction_topic: Optional[str] = None):
         """
-        on_status: callback(robot_id, subsystem, payload_dict) invoked whenever
-        a robot subsystem publishes on robots/<id>/<subsystem>/status.
-        payload_dict looks like {"subtask_id": "...", "state": "done"|"failed",
-        "result": {...}}
+        on_status: callback(robot_id, subsystem, payload_dict) for
+        robots/<id>/<subsystem>/status messages.
+
+        on_instruction: callback(instruction_dict) for new-task messages on
+        instruction_topic (defaults to config.INSTRUCTION_TOPIC). Pass None
+        if this client instance shouldn't listen for instructions at all
+        (e.g. a test harness that only cares about robot status).
         """
         import paho.mqtt.client as mqtt  # imported lazily so this module can be
                                           # imported (e.g. for type hints/tests)
@@ -48,6 +52,8 @@ class SchedulerMQTTClient:
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
         self._on_status = on_status
+        self._on_instruction = on_instruction
+        self._instruction_topic = instruction_topic or config.INSTRUCTION_TOPIC
         self._host = broker_host
         self._port = broker_port
 
@@ -62,12 +68,20 @@ class SchedulerMQTTClient:
     def _on_connect(self, client, userdata, flags, rc):
         logger.info("Connected to MQTT broker (rc=%s)", rc)
         client.subscribe(STATUS_TOPIC_WILDCARD, qos=1)
+        if self._on_instruction:
+            client.subscribe(self._instruction_topic, qos=1)
+            logger.info("Subscribed to instruction topic: %s", self._instruction_topic)
 
     def _on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             logger.warning("Ignoring non-JSON message on %s", msg.topic)
+            return
+
+        if msg.topic == self._instruction_topic:
+            if self._on_instruction:
+                self._on_instruction(payload)
             return
 
         # topic shape: robots/<robot_id>/<subsystem>/status

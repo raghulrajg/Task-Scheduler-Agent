@@ -1,0 +1,17 @@
+# Example systemd unit for reasoning_agent.py (the Ollama-backed prompt parser).
+[Unit]
+Description=Reasoning agent (Ollama prompt -> MQTT instruction)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sam
+WorkingDirectory=/home/sam/task_scheduler_pkg
+EnvironmentFile=/home/sam/task_scheduler_pkg/.env
+ExecStart=/usr/bin/python3 /home/sam/task_scheduler_pkg/reasoning_agent.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

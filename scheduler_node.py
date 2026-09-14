@@ -7,9 +7,10 @@ task-queue topic your agent_llm_node publishes structured instructions to
 log line from your reasoning agent), runs it through TaskScheduler, and lets
 the scheduler talk to individual robots over MQTT.
 
-Adjust REASONING_AGENT_TOPIC below to whatever your agent_llm_node actually
-publishes on (it wasn't fully visible in your setup — this is the one thing
-to confirm).
+Configuration (broker host/port/credentials, the reasoning-agent topic name,
+metadata file path) all comes from config.py, which reads environment
+variables with sensible defaults -- see .env.example. Nothing here needs
+editing to move between machines; set the env vars instead.
 
 Run:
     ros2 run task_scheduler_pkg scheduler_node
@@ -24,6 +25,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
+import config
 from robot_registry import RobotRegistry
 from mqtt_client import SchedulerMQTTClient
 from scheduler import TaskScheduler
@@ -31,42 +33,35 @@ from scheduler import TaskScheduler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scheduler_node")
 
-REASONING_AGENT_TOPIC = "robot_task_queue"   # <-- confirm/rename to match agent_llm_node's publisher
-ROBOT_METADATA_PATH = "robots_metadata.json"
-MQTT_BROKER_HOST = "172.25.200.57"
-MQTT_BROKER_PORT = 1883
-MQTT_USERNAME = "raghulrajg"
-MQTT_PASSWORD = "Gr2_nemam"
-
 
 class SchedulerNode(Node):
     def __init__(self):
         super().__init__("task_scheduler_node")
 
-        self.registry = RobotRegistry(ROBOT_METADATA_PATH)
+        self.registry = RobotRegistry(config.ROBOT_METADATA_PATH)
         self.mqtt_client = SchedulerMQTTClient(
-            broker_host=MQTT_BROKER_HOST,
-            broker_port=MQTT_BROKER_PORT,
+            broker_host=config.MQTT_BROKER_HOST,
+            broker_port=config.MQTT_BROKER_PORT,
             client_id="task_scheduler_node",
-            username=MQTT_USERNAME,
-            password=MQTT_PASSWORD,
+            username=config.MQTT_USERNAME,
+            password=config.MQTT_PASSWORD,
             on_status=self._on_robot_status,
         )
         self.scheduler = TaskScheduler(self.registry, self.mqtt_client)
         self.mqtt_client.connect()
 
         self.subscription = self.create_subscription(
-            String, REASONING_AGENT_TOPIC, self._on_instruction, 10
+            String, config.REASONING_AGENT_TOPIC, self._on_instruction, 10
         )
         self.get_logger().info(
-            f"Task scheduler ready, listening on '{REASONING_AGENT_TOPIC}'"
+            f"Task scheduler ready, listening on '{config.REASONING_AGENT_TOPIC}'"
         )
 
     def _on_instruction(self, msg: String):
         try:
             instruction = json.loads(msg.data)
         except json.JSONDecodeError:
-            self.get_logger().error(f"Bad JSON on {REASONING_AGENT_TOPIC}: {msg.data}")
+            self.get_logger().error(f"Bad JSON on {config.REASONING_AGENT_TOPIC}: {msg.data}")
             return
         task_id = self.scheduler.submit_instruction(instruction)
         self.get_logger().info(f"Submitted task {task_id}: {instruction}")

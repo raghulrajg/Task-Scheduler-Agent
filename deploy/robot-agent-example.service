@@ -1,0 +1,23 @@
+# Example systemd unit for ONE robot subsystem's agent process.
+# Copy this file once per subsystem you run on this machine, e.g.:
+#   robot-agent-robot_01-amr.service   (ExecStart: --robot-id robot_01 --subsystem amr)
+#   robot-agent-robot_01-arm.service   (ExecStart: --robot-id robot_01 --subsystem arm)
+# Install each: sudo cp <file> /etc/systemd/system/
+#               sudo systemctl daemon-reload
+#               sudo systemctl enable --now <name>
+[Unit]
+Description=Robot subsystem MQTT agent (robot_01 / amr)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robot
+WorkingDirectory=/home/robot/task_scheduler_pkg
+EnvironmentFile=/home/robot/task_scheduler_pkg/.env
+ExecStart=/usr/bin/python3 /home/robot/task_scheduler_pkg/robot_agent.py --robot-id robot_01 --subsystem amr
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

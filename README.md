@@ -6,6 +6,11 @@ Sits between your reasoning agent (JSON instructions like `{"product": "ABCD",
 robots. Decomposes the instruction into ordered subtasks, allocates each to a
 robot by capability match, and dispatches over MQTT.
 
+**MQTT end to end -- no ROS2.** The reasoning agent publishes its instruction
+JSON as a plain MQTT message on `scheduler/instructions`; the scheduler
+publishes/subscribes to robot topics the same way it always did. One
+transport for the whole pipeline.
+
 ## Fleet model
 
 Each entry in `robots_metadata.json` is **one physical robot**, which can have
@@ -82,34 +87,49 @@ double-claims, nothing dropped.
 | File | Responsibility |
 |---|---|
 | `robots_metadata.json` | Your fleet: id, subsystems (topic + capabilities each), zones, status. |
+| `config.py` | All deployment settings (broker host/port/creds, topic names) read from env vars / `.env`, with your values as defaults. |
+| `.env.example` | Copy to `.env` on each machine and fill in real values; never commit the real one. |
 | `robot_registry.py` | Loads metadata; atomic `try_claim` for allocation. |
 | `task_decomposer.py` | Instruction -> ordered subtask graph, tagged with `group` (carrier/inspector) and `releases_robot`. |
 | `allocator.py` | Translates a subtask into a `try_claim` call. |
-| `mqtt_client.py` | Publishes to `robots/<id>/<subsystem>/task`, subscribes to `robots/+/+/status`. |
+| `mqtt_client.py` | Scheduler-side: publishes to `robots/<id>/<subsystem>/task`, subscribes to `robots/+/+/status`. |
 | `scheduler.py` | Orchestrator: sticky carrier assignment, retry queue, locking, branch resolution. |
-| `scheduler_node.py` | ROS2 node wiring (ties the reasoning agent's topic to the scheduler). |
-| `manual_runner.py` | Runs without ROS2 — for testing with a hand-written instruction against a real broker. |
-| `test_scheduler_offline.py` | Single-task walkthrough + concurrency stress test, no broker/ROS2 needed. |
+| `scheduler_service.py` | The production entry point — MQTT only. Subscribes to `scheduler/instructions` for new tasks and `robots/+/+/status` for acks. |
+| `reasoning_agent.py` | Converted from your `agent_llm_node.py` — no ROS2. Subscribes to `hmi/user_prompt` over MQTT, calls Ollama, publishes the resulting JSON to `scheduler/instructions`. |
+| `manual_runner.py` | For manual testing — submits one instruction you supply directly (file or default), instead of waiting on the instruction topic. |
+| `robot_agent.py` | **Robot-side** agent — runs on each subsystem's controller, subscribes to its task topic, and publishes the status ack once `execute_task()` finishes. `execute_task()` is ported from your `manipulator_control_node.py` (navigate/gripper/QC-simulate), split per action so it fits the decomposed-subtask model instead of one node running the whole job. This is what closes the loop end to end. |
+| `test_scheduler_offline.py` | Single-task walkthrough + concurrency stress test, no broker needed. |
+| `requirements.txt` | `paho-mqtt`, `python-dotenv`. |
+| `deploy/task-scheduler.service` | systemd unit for the scheduler process, auto-restart on failure. |
+| `deploy/robot-agent-example.service` | systemd unit template for one robot subsystem's agent — copy per subsystem. |
 
-## Wiring it up
+## Deploying for real
 
-1. Fill in `robots_metadata.json` with your real robot ids/names and QC
-   station count.
-2. `pip install paho-mqtt --break-system-packages`
-3. `python3 test_scheduler_offline.py` first — validates dispatch order,
-   branch resolution, sticky-robot behavior, and concurrency, with no
-   network involved.
-4. For a live test without the reasoning agent: `python3 manual_runner.py`
-   (broker host/user/pass are already filled in at the top of that file).
-5. Each robot subsystem's controller needs to: subscribe to its own
-   `.../task` topic, execute what it's told, and publish `{"subtask_id",
-   "state", "result"}` back on its own `.../status` topic. That's the one
-   piece of new code needed on the robot side to close the loop.
-6. Once the reasoning agent is back in the loop, confirm
-   `REASONING_AGENT_TOPIC` in `scheduler_node.py` matches whatever
-   `agent_llm_node` actually publishes JSON instructions on, then run via
-   `ros2 run` (after adding the usual `setup.py`/`package.xml`) or directly
-   with `python3 scheduler_node.py`.
+1. `cp .env.example .env` on the scheduler host and on each robot controller
+   box that will run `robot_agent.py`; fill in real values (already
+   defaulted to what you gave, but `.env` is what you'd actually edit per
+   machine going forward instead of touching source).
+2. `pip install -r requirements.txt` on every machine.
+3. Fill in `robots_metadata.json` with your real fleet.
+4. On the scheduler host: `sudo cp deploy/task-scheduler.service /etc/systemd/system/`,
+   edit the `User=`/paths (now pointing at `scheduler_service.py`), then
+   `sudo systemctl enable --now task-scheduler`.
+5. On each robot's controller box: implement `execute_task()` in
+   `robot_agent.py` for that subsystem (Nav2 goal for `amr`, MoveIt pick/place
+   for `arm`, your vision pipeline for `scanner`) — the stub just sleeps and
+   returns success so you can validate the MQTT loop first. Then copy
+   `deploy/robot-agent-example.service` per subsystem, adjust `--robot-id`/
+   `--subsystem` in `ExecStart`, and enable it the same way.
+6. Run `reasoning_agent.py` — it listens on `HMI_PROMPT_TOPIC`
+   (`hmi/user_prompt`) for raw prompts, calls Ollama, and publishes to
+   `INSTRUCTION_TOPIC` (`scheduler/instructions`), which `scheduler_service.py`
+   is already listening on. `deploy/reasoning-agent.service` is the systemd
+   unit for it.
+7. Test end to end by publishing a raw prompt yourself:
+   `mosquitto_pub -h $MQTT_BROKER_HOST -u $MQTT_USERNAME -P $MQTT_PASSWORD -t hmi/user_prompt -m "take the ABCD product from manufacturing_1, check quality, route to package_area or waste_area"`
+
+Everything above also runs directly with `python3 <file>.py` for testing
+before you commit to systemd.
 
 ## Extending
 

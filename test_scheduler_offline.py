@@ -2,7 +2,7 @@
 test_scheduler_offline.py
 --------------------------
 Exercises decompose -> allocate -> dispatch -> ack -> branch -> complete
-with a fake MQTT client (no broker/ROS2 needed), PLUS a concurrency test
+with a fake MQTT client (no broker needed), PLUS a concurrency test
 that fires several instructions at once from real threads to check that no
 two of them ever get double-claimed onto the same robot.
 
@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 
+import config
 from robot_registry import RobotRegistry
 from scheduler import TaskScheduler
 
@@ -36,7 +37,7 @@ def single_task_walkthrough():
     print("=" * 60)
     print("SINGLE TASK WALKTHROUGH")
     print("=" * 60)
-    registry = RobotRegistry("robots_metadata.json")
+    registry = RobotRegistry(config.ROBOT_METADATA_PATH)
     mqtt = FakeMQTTClient()
     scheduler = TaskScheduler(registry, mqtt)
 
@@ -81,7 +82,7 @@ def concurrency_stress_test():
     print("=" * 60)
     print("CONCURRENCY TEST: 6 instructions submitted at once, 4 combo robots available")
     print("=" * 60)
-    registry = RobotRegistry("robots_metadata.json")
+    registry = RobotRegistry(config.ROBOT_METADATA_PATH)
     mqtt = FakeMQTTClient()
     scheduler = TaskScheduler(registry, mqtt)
 
