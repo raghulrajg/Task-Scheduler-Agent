@@ -35,8 +35,7 @@ INSTRUCTION_TOPIC = os.environ.get("INSTRUCTION_TOPIC", "scheduler/instructions"
 # one into an instruction it publishes on INSTRUCTION_TOPIC above.
 HMI_PROMPT_TOPIC = os.environ.get("HMI_PROMPT_TOPIC", "hmi/user_prompt")
 
-# Ollama -- defaults to the same host as the MQTT broker ("same configuration"),
-# override OLLAMA_HOST separately if Ollama actually runs elsewhere.
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", MQTT_BROKER_HOST)
+# Ollama runs on its own host, separate from the MQTT broker.
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "172.16.13.90")
 OLLAMA_PORT = int(os.environ.get("OLLAMA_PORT", "11434"))
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3:8b")
