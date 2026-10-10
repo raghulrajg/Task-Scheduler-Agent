@@ -40,8 +40,9 @@ def cancelled(reason: str = "cancelled") -> Dict[str, Any]:
 
 
 def robot_state(ready: bool, detail: str = "", estop: bool = False,
-                battery: Optional[float] = None) -> Dict[str, Any]:
-    return {"ready": bool(ready), "detail": detail, "estop": bool(estop), "battery": battery}
+                battery: Optional[float] = None, **extra: Any) -> Dict[str, Any]:
+    """extra keys (e.g. travel_pose=True) are passed through to the heartbeat."""
+    return {"ready": bool(ready), "detail": detail, "estop": bool(estop), "battery": battery, **extra}
 
 
 class Driver(ABC):

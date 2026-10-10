@@ -18,7 +18,6 @@ Run:
     python3 scheduler_service.py
 """
 
-import fcntl
 import logging
 import os
 import signal
@@ -39,12 +38,20 @@ STATUS_PERIOD_S = 5.0
 
 
 def acquire_single_instance_lock(state_path: str):
+    """Exclusive lock file so two schedulers can't run from the same state
+    directory. Works on Linux/macOS (fcntl) and Windows (msvcrt)."""
     directory = os.path.dirname(state_path) or "."
     os.makedirs(directory, exist_ok=True)
-    lock_file = open(state_path + ".lock", "w")
+    lock_file = open(state_path + ".lock", "a+")
     try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
         raise SystemExit(f"Another scheduler is already running (lock {state_path}.lock)")
     return lock_file
 

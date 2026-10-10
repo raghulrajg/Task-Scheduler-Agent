@@ -1,0 +1,26 @@
+{
+  "_comment": "MiR base of mobile manipulator robot_01. Fill in host and the mission GUID for every location (python3 tools/mir_missions.py lists them). Credentials come from the environment (.env), never from this file.",
+  "robot_id": "robot_01",
+  "subsystem": "amr",
+  "heartbeat_s": 5,
+  "interlock_with": ["arm"],
+  "driver": {
+    "type": "mir",
+    "host": "192.168.12.20",
+    "port": 80,
+    "username": "${MIR_USERNAME}",
+    "password": "${MIR_PASSWORD}",
+    "locations": {
+      "manufacturing_1": { "mission_guid": "REPLACE-WITH-MISSION-GUID", "parameters": [] },
+      "quality_station": { "mission_guid": "REPLACE-WITH-MISSION-GUID" },
+      "package_area":    { "mission_guid": "REPLACE-WITH-MISSION-GUID" },
+      "waste_area":      { "mission_guid": "REPLACE-WITH-MISSION-GUID" },
+      "rest_position":   { "mission_guid": "REPLACE-WITH-MISSION-GUID" }
+    },
+    "poll_interval_s": 1.0,
+    "ready_wait_s": 15,
+    "request_timeout_s": 5,
+    "max_comm_loss_s": 30,
+    "mission_timeout_s": 280
+  }
+}

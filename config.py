@@ -3,8 +3,8 @@ config.py
 ---------
 Deployment settings, read from environment variables (or a local .env file).
 
-Loading order: real environment variables > .env file (if python-dotenv is
-installed) > the defaults below.
+Loading order: real environment variables > .env file (or the file named by
+ENV_FILE, e.g. ENV_FILE=.env.offline) > the defaults below.
 
 There are deliberately NO credential defaults in this file. Broker username
 and password must come from the environment / .env on each machine, and .env
@@ -15,7 +15,12 @@ import os
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # no-op if there's no .env file
+    # ENV_FILE picks another settings file, e.g. ENV_FILE=.env.offline for a
+    # local simulation that must not touch the real broker or real state.
+    _env_file = os.environ.get("ENV_FILE")
+    if _env_file and not os.path.isabs(_env_file):
+        _env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), _env_file)
+    load_dotenv(_env_file or None)  # no-op if the file doesn't exist
 except ImportError:
     pass
 

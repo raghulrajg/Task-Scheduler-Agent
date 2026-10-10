@@ -61,10 +61,17 @@ class RobotAgent:
     def __init__(self, robot_id: str, subsystem: str, driver: Driver,
                  heartbeat_s: float = 5.0, interlock_with: Tuple[str, ...] = (),
                  clock_skew_tolerance_s: float = 5.0, client_id: Optional[str] = None,
+                 require_travel_pose: Tuple[str, ...] = (),
                  host: Optional[str] = None, port: Optional[int] = None):
         self.robot_id, self.subsystem, self.driver = robot_id, subsystem, driver
         self.heartbeat_s = heartbeat_s
         self.interlock_with = tuple(interlock_with)
+        # Siblings that must POSITIVELY report travel_pose=true before we act
+        # (a base carrying an arm: "unknown" is treated as "not tucked in").
+        self.require_travel_pose = tuple(require_travel_pose)
+        unknown = set(self.require_travel_pose) - set(self.interlock_with)
+        if unknown:
+            raise ValueError(f"require_travel_pose {sorted(unknown)} must also be listed in interlock_with")
         self.skew = clock_skew_tolerance_s
         self.task_topic = TASK_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
         self.status_topic = STATUS_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
@@ -136,6 +143,8 @@ class RobotAgent:
         payload = {"online": True, "ready": bool(st.get("ready")), "estop": bool(st.get("estop")),
                    "battery": st.get("battery"), "detail": st.get("detail", ""),
                    "busy": current is not None, "current": current, "ts": time.time()}
+        if "travel_pose" in st:
+            payload["travel_pose"] = st["travel_pose"]
         self._client.publish(self.state_topic, json.dumps(payload), qos=1, retain=True)
 
     # ---- task handling ---------------------------------------------------------------
@@ -148,6 +157,11 @@ class RobotAgent:
                 return f"interlock: sibling '{sib}' is offline"
             if st.get("busy"):
                 return f"interlock: sibling '{sib}' is busy with {st.get('current')}"
+            if st.get("travel_pose") is False:
+                return f"interlock: sibling '{sib}' is not in its travel pose"
+            if sib in self.require_travel_pose and st.get("travel_pose") is not True:
+                return (f"interlock: sibling '{sib}' does not report a travel pose -- set travel_joints "
+                        f"in its agent config")
         return None
 
     def _handle_task(self, task: Dict[str, Any]):
@@ -206,10 +220,11 @@ class RobotAgent:
         with self._lock:
             self._remember(key, result)
             self._current = None
-        # Heartbeat (busy=False) goes out BEFORE the result: the scheduler only
-        # dispatches the sibling's next step after seeing the result, so the
-        # sibling's interlock already knows we're idle.
-        self._publish_heartbeat(refresh=False)
+        # Fresh heartbeat (busy=False, current travel pose) goes out BEFORE the
+        # result: the scheduler only dispatches the sibling's next step after
+        # seeing the result, so the sibling's interlock already sees our final
+        # state. (We're on the worker thread, so a slow get_state() is fine.)
+        self._publish_heartbeat(refresh=True)
         self._publish_status(result, retain=True)
 
     def _handle_cancel(self, msg: Dict[str, Any]):
@@ -300,7 +315,10 @@ def main():
     driver = create_driver(cfg["driver"])
 
     if args.check:
-        print(json.dumps(driver.get_state(), indent=2))
+        report = driver.get_state()
+        if hasattr(driver, "check_result_channel"):
+            report["result_channel"] = driver.check_result_channel()
+        print(json.dumps(report, indent=2))
         return
     if args.test:
         action, zone = args.test
@@ -319,6 +337,7 @@ def main():
     agent = RobotAgent(robot_id, subsystem, driver,
                        heartbeat_s=float(cfg.get("heartbeat_s", 5)),
                        interlock_with=tuple(cfg.get("interlock_with", [])),
+                       require_travel_pose=tuple(cfg.get("require_travel_pose", [])),
                        clock_skew_tolerance_s=float(cfg.get("clock_skew_tolerance_s", 5)))
     agent.run_forever()
 

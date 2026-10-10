@@ -375,3 +375,33 @@ def test_concurrent_submissions_never_double_claim(site, registry, clock):
     step(tid0)
     assert sched.task_state(tid0) == "completed"
     assert len(sched.pending()) == 1
+
+
+def test_queued_event_announced_once(site, registry, clock):
+    sched, mqtt = make(site, registry, clock)
+    for i in range(5):
+        sched.submit_instruction({**INSTRUCTION, "product": f"P{i}"})
+    for _ in range(10):
+        sched.tick()
+    assert mqtt.event_names().count("subtask_queued") == 1
+    assert len(sched.pending()) == 1
+
+
+def test_reassignment_never_reuses_a_dispatch_identity(site, registry, clock):
+    """After a job moves to another robot and later back, no robot may receive a
+    (subtask_id, attempt) it has already seen -- its agent would replay the old result."""
+    sched, mqtt = make(site, registry, clock)
+    sched.submit_instruction(INSTRUCTION)
+    for _ in range(site.retries_for("navigate") + 1):
+        ack(sched, mqtt, state="failed", error="path blocked")          # robot_01 gives up -> reassigned
+    sched.handle_command({"cmd": "reset_robot", "robot_id": "robot_01"})
+    for _ in range(site.retries_for("navigate") + 1):
+        ack(sched, mqtt, state="failed", error="path blocked")          # robot_02 gives up -> reassigned
+    seen = [(r, m["subtask_id"], m["attempt"]) for r, _, m in mqtt.tasks]
+    assert len(seen) == len(set(seen))
+    ids = [(m["subtask_id"], m["attempt"]) for _, _, m in mqtt.tasks]
+    assert len(ids) == len(set(ids)), "attempt numbers must keep increasing across reassignments"
+    # the new robot still gets its full retry budget
+    robot, _, msg = mqtt.tasks[-1]
+    ack(sched, mqtt, state="failed", error="blip")
+    assert mqtt.tasks[-1][0] == robot and mqtt.tasks[-1][2]["attempt"] == msg["attempt"] + 1

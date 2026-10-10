@@ -134,6 +134,14 @@ class Stack:
         self.agents[(robot_id, topic)] = agent
         return agent
 
+    def add_driver_agent(self, robot_id, topic, driver, siblings=(), require_travel_pose=()):
+        agent = RobotAgent(robot_id, topic, driver, heartbeat_s=1, interlock_with=siblings,
+                           require_travel_pose=require_travel_pose,
+                           client_id=f"agent_{robot_id}_{topic}_{time.time_ns()}", host="127.0.0.1", port=self.port)
+        agent.start()
+        self.agents[(robot_id, topic)] = agent
+        return agent
+
     def _on_instruction(self, instr):
         try:
             self.scheduler.submit_instruction(instr)
@@ -285,3 +293,63 @@ def test_reasoning_agent_validates_llm_output(stack, broker, monkeypatch):
     assert wait_for(lambda: any(e["event"] == "task_completed" for e in ev.json(config.EVENT_TOPIC)), 20)
     agent._stop.set()
     ev.close()
+
+
+def test_full_job_with_dobot_and_web_amr_drivers(broker, tmp_path, monkeypatch):
+    """robot_01 = web-dashboard AMR (http_amr driver) + Dobot Nova 2 (dobot driver),
+    against protocol-faithful fakes; QC simulated. Exercises the real drivers,
+    the travel-pose interlock and the whole MQTT chain."""
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from drivers import create_driver
+    from fake_amr import FakeAMR
+    from fake_dobot import FakeDobot
+
+    amr = FakeAMR(points=("station_A", "station_B", "station_C", "station_D"), drive_time=0.3, pickup_delay=0.1)
+    arm = FakeDobot(run_time=0.2, projects=("pick_mfg", "place_pkg", "place_waste"))
+    monkeypatch.setenv("TEST_AMR_PW", "pw{1}")
+    stack = Stack(broker, str(tmp_path), start_agents=False)
+    try:
+        amr_drv = create_driver({
+            "type": "http_amr", "base_url": amr.url,
+            "login": {"method": "POST", "path": "/api/login",
+                      "json": {"username": "admin", "password": "${TEST_AMR_PW}"}, "token_path": "data.token"},
+            "locations": {"manufacturing_1": {"id": "station_A"}, "quality_station": {"id": "station_B"},
+                          "package_area": {"id": "station_C"}, "waste_area": {"id": "station_D"}},
+            "navigate": {"method": "POST", "path": "/api/nav/goto", "json": {"point": "{id}"},
+                         "ok_path": "code", "ok_values": [0]},
+            "cancel": {"method": "POST", "path": "/api/nav/cancel"},
+            "status": {"method": "GET", "path": "/api/robot/status"},
+            "fields": {"nav_state": "data.nav.state", "running_values": ["RUNNING"],
+                       "arrived_values": ["SUCCEEDED"], "failed_values": ["FAILED", "CANCELED"],
+                       "target": "data.nav.target", "battery": "data.battery", "battery_scale": 100,
+                       "estop": "data.emergency"},
+            "poll_interval_s": 0.05, "settle_s": 1.0})
+        arm_drv = create_driver({
+            "type": "dobot", "host": "127.0.0.1", "port": arm.port, "protocol": "v4",
+            "projects": {"pick": {"manufacturing_1": "pick_mfg"},
+                         "place": {"package_area": "place_pkg", "waste_area": "place_waste"}},
+            "travel_joints": [0, -30, 120, 0, 90, 0], "poll_interval_s": 0.05})
+        stack.add_driver_agent("robot_01", "amr", amr_drv, siblings=("arm",), require_travel_pose=("arm",))
+        stack.add_driver_agent("robot_01", "arm", arm_drv, siblings=("amr",))
+        stack.add_agent("qc_01", "scanner", qc_pass_rate=0.0)          # part fails QC -> waste
+        assert wait_for(lambda: stack.registry.fleet_view() and next(
+            r for r in stack.registry.fleet_view() if r["id"] == "robot_01")["healthy"], 10), \
+            stack.registry.fleet_view()
+
+        ev = Listener(broker, [config.EVENT_TOPIC])
+        ev.publish(config.INSTRUCTION_TOPIC, {**INSTRUCTION, "request_id": "hw-1"})
+        assert wait_for(lambda: any(e["event"] in ("task_completed", "task_failed")
+                                    for e in ev.json(config.EVENT_TOPIC)), 30), \
+            [e["event"] for e in ev.json(config.EVENT_TOPIC)]
+        events = ev.json(config.EVENT_TOPIC)
+        assert [e for e in events if e["event"] == "task_completed"][0]["branch"] == "fail"
+        assert "subtask_retry" not in [e["event"] for e in events], "interlock/heartbeat race caused a retry"
+        assert [r[2] for r in amr.requests if r[1] == "/api/nav/goto"] == [
+            {"point": "station_A"}, {"point": "station_B"}, {"point": "station_D"}]
+        assert 'RunScript("pick_mfg")' in arm.commands and 'RunScript("place_waste")' in arm.commands
+        ev.close()
+    finally:
+        stack.close()
+        amr.close()
+        arm.close()

@@ -1,0 +1,21 @@
+{
+  "_comment": "UR arm of mobile manipulator robot_01. One PolyScope program per (action, location); each program must write Modbus register 128 = 1 on success / 2 on failure (see drivers/ur.py).",
+  "robot_id": "robot_01",
+  "subsystem": "arm",
+  "heartbeat_s": 5,
+  "interlock_with": ["amr"],
+  "driver": {
+    "type": "ur",
+    "host": "192.168.12.21",
+    "dashboard_port": 29999,
+    "modbus_port": 502,
+    "programs": {
+      "pick":  { "manufacturing_1": "pick_manufacturing_1.urp" },
+      "place": { "package_area": "place_package_area.urp", "waste_area": "place_waste_area.urp" }
+    },
+    "result_register": 128,
+    "program_timeout_s": 110,
+    "poll_interval_s": 0.25,
+    "require_remote_control": true
+  }
+}

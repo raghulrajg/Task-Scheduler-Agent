@@ -270,7 +270,7 @@ class TaskScheduler:
             if task["subtasks"][sid]["depends_on"] is None:
                 self._try_dispatch(task_id, sid)
 
-    def _try_dispatch(self, task_id: str, sid: str) -> bool:
+    def _try_dispatch(self, task_id: str, sid: str, from_queue: bool = False) -> bool:
         task = self._tasks[task_id]
         if task["state"] != "active" or sid in self._in_flight:
             return False
@@ -286,9 +286,10 @@ class TaskScheduler:
                 robot = self.allocator.allocate(sub)
             except AllocationError as e:
                 if (task_id, sid) not in self._pending:
-                    logger.info("%s -- queued", e)
                     self._pending.append((task_id, sid))
-                    self._event("subtask_queued", task_id, subtask_id=sid, action=sub["action"])
+                    if not from_queue:  # announce once, not on every retry pass
+                        logger.info("%s -- queued", e)
+                        self._event("subtask_queued", task_id, subtask_id=sid, action=sub["action"])
                 return False
             if sub["group"] == "carrier":
                 task["carrier_robot"] = robot.id
@@ -317,7 +318,7 @@ class TaskScheduler:
             task = self._tasks.get(task_id)
             if not task or task["state"] != "active" or sid in self._in_flight or sid in task["completed"]:
                 continue
-            self._try_dispatch(task_id, sid)  # re-queues itself if still blocked
+            self._try_dispatch(task_id, sid, from_queue=True)  # re-queues itself if still blocked
         self._dirty = True
 
     def _on_done(self, task, sub, robot_id: str, payload: Dict[str, Any]):
@@ -361,10 +362,14 @@ class TaskScheduler:
         task_id = task["task_id"]
         self._dirty = True
 
-        if sub["attempt"] <= self.site.retries_for(action):
+        # "attempt" is the dispatch identity robots de-duplicate on, so it only
+        # ever increases; "tries" is the retry budget on the current robot.
+        tries = sub.get("tries", sub["attempt"])
+        if tries <= self.site.retries_for(action):
             sub["attempt"] += 1
+            sub["tries"] = tries + 1
             logger.warning("Task %s: %s failed on %s (%s) -- retry #%d",
-                           task_id, sid, robot_id, reason, sub["attempt"] - 1)
+                           task_id, sid, robot_id, reason, tries)
             self._event("subtask_retry", task_id, subtask_id=sid, action=action,
                         robot_id=robot_id, reason=reason, attempt=sub["attempt"])
             if sub["group"] == "inspector":
@@ -389,7 +394,8 @@ class TaskScheduler:
             task["carrier_robot"] = None
             task["completed"] = []
             for s in task["subtasks"].values():
-                s["attempt"] = 1
+                s["attempt"] += 1   # new identity: never reuse an id a robot has already seen
+                s["tries"] = 1
             logger.warning("Task %s: nothing on board yet, reassigning to another robot (%d/%d)",
                            task_id, task["reassignments"], self.site.max_task_reassignments)
             self._event("task_reassigned", task_id, from_robot=robot_id, reason=reason)

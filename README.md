@@ -11,8 +11,8 @@ HMI / voice ──hmi/user_prompt──▶ reasoning_agent.py ──scheduler/in
    └──hmi/feedback──┘                                       robots/<id>/<sub>/task   │  ▲ robots/<id>/<sub>/status
                                                                                      ▼  │ robots/<id>/<sub>/state
                                                        robot_agent.py (one per subsystem)
-                                                         ├─ drivers/mir.py         MiR REST API   (navigate)
-                                                         ├─ drivers/ur.py          UR Dashboard + Modbus (pick/place)
+                                                         ├─ drivers/http_amr.py    mobile robot web API, config-driven (navigate)
+                                                         ├─ drivers/dobot.py       Dobot Nova/CR TCP/IP, port 29999 (pick/place)
                                                          └─ drivers/inspection.py  HTTP or TCP vision (quality_check)
 ```
 
@@ -22,20 +22,41 @@ HMI / voice ──hmi/user_prompt──▶ reasoning_agent.py ──scheduler/in
 > (ISO 10218 / ISO/TS 15066 for the arm, ISO 3691-4 for the AMR). See
 > [docs/COMMISSIONING.md](docs/COMMISSIONING.md) before running on hardware.
 
-## Quick start (simulated fleet, no hardware)
+## Offline testing (no robots)
+
+**1. Offline demo: nothing needed, not even a broker.** It runs the real
+scheduler against simulated robots in memory, with simulated time, and prints
+every step: normal job, QC fail, missed pick, silent robot, busy fleet,
+restart mid-job, the Dobot/AMR drivers against fake controllers...
 
 ```bash
-python3 -m venv venv && . venv/bin/activate
-pip install -r requirements-dev.txt
-sudo apt install mosquitto          # or point MQTT_BROKER_HOST at your broker
-cp .env.example .env                # set MQTT_BROKER_HOST=localhost, MQTT_BROKER_PORT=1883, MQTT_TLS=0
-
-python3 scheduler_service.py &                 # terminal 1
-python3 tools/run_sim_fleet.py &               # terminal 2: sim agent for every subsystem
-python3 manual_runner.py                       # terminal 3: submit one job and follow it
-python3 tools/fleetctl.py status               # fleet + tasks
-pytest                                         # ~110 tests incl. end-to-end over a real broker
+python3 offline_demo.py            # all scenarios, ends with PASS/FAIL per scenario
+python3 offline_demo.py --list     # what each scenario shows
+python3 offline_demo.py pick_fail  # just one
+python3 offline_demo.py --jobs 10 --qc-pass-rate 0.7 --seed 1   # push 10 jobs through the fleet
 ```
+
+**2. Automated tests.** The MQTT end-to-end tests run only if `mosquitto` is
+installed locally; otherwise they are skipped.
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+**3. Whole system with simulated robots on this PC** (local broker, your real
+`.env` untouched):
+
+```bash
+sudo apt install mosquitto                          # Windows: installer from mosquitto.org
+export ENV_FILE=.env.offline                        # Windows PowerShell: $env:ENV_FILE=".env.offline"
+python3 scheduler_service.py                        # terminal 1
+python3 tools/run_sim_fleet.py                      # terminal 2: fake robots
+python3 manual_runner.py                            # terminal 3: send one job, follow it
+python3 tools/fleetctl.py status
+```
+Set `ENV_FILE` in every terminal. `.env.offline` points at `localhost` and
+uses its own state file, so simulated jobs never mix with real ones.
 
 ## How a job runs
 
@@ -69,22 +90,26 @@ pytest                                         # ~110 tests incl. end-to-end ove
 |---|---|
 | `site.json` | Valid locations (the LLM may use only these), timeouts, retries, battery limit. |
 | `robots_metadata.json` | Fleet: robots, subsystems, capabilities, zones. |
-| `agents/*.json` | Per-subsystem agent config: driver type, host, location → MiR mission / UR program mapping. |
+| `agents/*.json` | Per-subsystem agent config: driver type, host, location → robot drop point / Dobot project mapping. `agents/examples/` has MiR and UR configs. |
 | `scheduler_service.py` | Scheduler process (MQTT, watchdog, status publishing, single-instance lock). |
 | `scheduler.py` | Scheduling logic: dispatch, acks, retries, failure policy, operator commands, persistence. |
 | `robot_registry.py` | Fleet status (`idle/busy/error/maintenance`) + live health, atomic claims. |
 | `validation.py` | Site config + instruction validation (shared by scheduler and reasoning agent). |
 | `task_decomposer.py` | Instruction → subtask graph. |
 | `robot_agent.py` | Runs a driver for one subsystem; dedupe, cancel, heartbeat + last-will, interlock. |
-| `drivers/` | `mir.py`, `ur.py`, `inspection.py` (HTTP / TCP), `sim.py`. Add vendors by subclassing `drivers.base.Driver`. |
+| `drivers/` | `http_amr.py` (any web-API mobile robot), `dobot.py` (Dobot Nova/CR, protocol v3/v4), `mir.py`, `ur.py`, `inspection.py` (HTTP / TCP), `sim.py`. Add vendors by subclassing `drivers.base.Driver`. |
 | `reasoning_agent.py` | Ollama prompt → validated instruction; optional operator confirmation. |
 | `mqtt_common.py`, `mqtt_client.py` | Hardened MQTT clients (persistent sessions, reconnect, TLS, guarded callbacks). |
 | `tools/fleetctl.py` | Operator CLI: `status`, `submit`, `cancel`, `reset`, `maintenance`, `watch`. |
-| `tools/mir_missions.py` | Lists MiR missions/GUIDs and checks your location mapping. |
+| `tools/har_summary.py` | Summarises a browser capture (HAR) of the robot dashboard's API, with secrets redacted. |
+| `tools/dobot_console.py` | Type Dobot TCP/IP commands by hand (RobotMode(), GetAngle(), ...) and see raw replies. |
+| `tools/api_watch.py` | Polls a status URL (GET only) and prints the fields that change while you drive the robot. |
+| `tools/mir_missions.py` | (MiR only) lists missions/GUIDs and checks your location mapping. |
 | `tools/run_sim_fleet.py` | Simulated agents for the whole fleet. |
 | `manual_runner.py` | Submit one job to the running scheduler and follow its events. |
 | `deploy/` | systemd units, mosquitto TLS + ACL config. |
 | `docs/COMMISSIONING.md` | Step-by-step bring-up on real robots. |
+| `docs/AMR_API_CAPTURE.md` | How to record and decode the mobile robot's web-dashboard API. |
 
 ## MQTT contract
 

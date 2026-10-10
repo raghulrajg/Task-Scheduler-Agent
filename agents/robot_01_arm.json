@@ -1,21 +1,26 @@
 {
-  "_comment": "UR arm of mobile manipulator robot_01. One PolyScope program per (action, location); each program must write Modbus register 128 = 1 on success / 2 on failure (see drivers/ur.py).",
+  "_comment": "Dobot Nova 2 mounted on robot_01's mobile base. travel_joints is required: the base will not drive until the arm reports it is in this pose. One DobotStudio Pro project per (action, location); each project ends in the travel pose and writes SetOutputInt(0, 1) on success / SetOutputInt(0, 2) on failure. Check the controller IP and firmware generation (v3/v4) in DobotStudio Pro before first use.",
   "robot_id": "robot_01",
   "subsystem": "arm",
   "heartbeat_s": 5,
   "interlock_with": ["amr"],
   "driver": {
-    "type": "ur",
-    "host": "192.168.12.21",
-    "dashboard_port": 29999,
-    "modbus_port": 502,
-    "programs": {
-      "pick":  { "manufacturing_1": "pick_manufacturing_1.urp" },
-      "place": { "package_area": "place_package_area.urp", "waste_area": "place_waste_area.urp" }
+    "type": "dobot",
+    "host": "192.168.5.1",
+    "port": 29999,
+    "protocol": "v4",
+    "projects": {
+      "pick":  {"manufacturing_1": "pick_manufacturing_1"},
+      "place": {"package_area": "place_package_area", "waste_area": "place_waste_area"}
     },
-    "result_register": 128,
-    "program_timeout_s": 110,
+    "result": {"kind": "output_int", "address": 0},
+    "request_control": true,
+    "auto_enable": false,
+    "enable_args": "",
+    "travel_joints": "REQUIRED: 6 joint angles of the tucked-in pose, read with tools/dobot_console.py GetAngle()",
+    "travel_tolerance_deg": 2.0,
+    "project_timeout_s": 110,
     "poll_interval_s": 0.25,
-    "require_remote_control": true
+    "request_timeout_s": 5
   }
 }

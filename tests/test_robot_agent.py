@@ -152,3 +152,44 @@ def test_idle_heartbeat_published_before_result():
     assert before and before[-1]["busy"] is False
     busy_beats = [p for t, p, _ in pub if t.endswith("/state") and p["busy"]]
     assert busy_beats, "siblings must see busy=True while executing"
+
+
+def test_interlock_blocks_when_sibling_arm_not_in_travel_pose():
+    agent, pub = make_agent(SlowDriver(0.01), interlock=("arm",))
+    agent._siblings["arm"] = {"online": True, "busy": False, "travel_pose": False}
+    agent._handle_task(task("a"))
+    st = [p for t, p, _ in pub if t.endswith("/status")][-1]
+    assert st["state"] == "failed" and "travel pose" in st["error"]
+    agent._siblings["arm"]["travel_pose"] = True
+    agent._handle_task(task("b"))
+    assert wait_for(lambda: ("b", 1, "done") in statuses(pub))
+
+
+def test_heartbeat_carries_travel_pose():
+    class ArmDriver(SlowDriver):
+        def get_state(self):
+            return robot_state(True, "ok", travel_pose=False)
+    agent, pub = make_agent(ArmDriver())
+    agent._publish_heartbeat()
+    hb = [p for t, p, _ in pub if t.endswith("/state")][-1]
+    assert hb["travel_pose"] is False
+
+
+def test_base_requires_positive_travel_pose_from_mounted_arm():
+    agent = RobotAgent("robot_01", "amr", SlowDriver(0.01), interlock_with=("arm",),
+                       require_travel_pose=("arm",), client_id="t2")
+    pub = []
+    agent._client.publish = lambda topic, payload, qos=0, retain=False: pub.append(
+        (topic, json.loads(payload), retain))
+    agent._siblings["arm"] = {"online": True, "busy": False}            # arm doesn't report a pose
+    agent._handle_task(task("a"))
+    st = [p for t, p, _ in pub if t.endswith("/status")][-1]
+    assert st["state"] == "failed" and "travel_joints" in st["error"]
+    agent._siblings["arm"]["travel_pose"] = True
+    agent._handle_task(task("b"))
+    assert wait_for(lambda: ("b", 1, "done") in statuses(pub))
+
+
+def test_require_travel_pose_must_be_interlocked():
+    with pytest.raises(ValueError):
+        RobotAgent("robot_01", "amr", SlowDriver(), interlock_with=(), require_travel_pose=("arm",))

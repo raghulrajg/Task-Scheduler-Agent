@@ -41,10 +41,16 @@ def create_driver(cfg: Dict[str, Any]) -> Driver:
     if kind == "ur":
         from drivers.ur import URDriver
         return URDriver(cfg)
+    if kind == "dobot":
+        from drivers.dobot import DobotDriver
+        return DobotDriver(cfg)
+    if kind == "http_amr":
+        from drivers.http_amr import HttpAmrDriver
+        return HttpAmrDriver(cfg)
     if kind == "http_inspection":
         from drivers.inspection import HttpInspectionDriver
         return HttpInspectionDriver(cfg)
     if kind == "tcp_inspection":
         from drivers.inspection import TcpInspectionDriver
         return TcpInspectionDriver(cfg)
-    raise ValueError(f"unknown driver type {kind!r}; expected sim|mir|ur|http_inspection|tcp_inspection")
+    raise ValueError(f"unknown driver type {kind!r}; expected sim|http_amr|dobot|mir|ur|http_inspection|tcp_inspection")
