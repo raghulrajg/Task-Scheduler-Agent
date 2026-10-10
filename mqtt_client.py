@@ -1,18 +1,20 @@
 """
 mqtt_client.py
 --------------
-Thin wrapper around paho-mqtt. This is now the ONLY transport in the system
--- no ROS2, no rclpy. One MQTT client on the scheduler side subscribes to
-two things:
+Scheduler-side MQTT transport.
 
-    scheduler/instructions          reasoning agent -> scheduler (new task)
-    robots/+/+/status                robot subsystem -> scheduler (task ack)
+Subscribes:
+    scheduler/instructions        new tasks (from reasoning agent / HMI)
+    scheduler/commands            operator commands (cancel_task, reset_robot, ...)
+    robots/+/+/status             task acks from robot agents
+    robots/+/+/state              retained heartbeats / last-will from robot agents
 
-and publishes to:
-
-    robots/<robot_id>/<subsystem>/task   scheduler -> robot subsystem
-
-Install: pip install paho-mqtt --break-system-packages
+Publishes:
+    robots/<id>/<sub>/task        {"type": "task", ...} and {"type": "cancel", ...}
+                                  (same topic, so a cancel can never overtake
+                                  the task it cancels)
+    scheduler/events              task lifecycle events for HMIs / logging
+    scheduler/status              retained fleet + task snapshot
 """
 
 import json
@@ -20,79 +22,91 @@ import logging
 from typing import Callable, Optional
 
 import config
+from mqtt_common import (STATE_TOPIC, STATUS_TOPIC, TASK_TOPIC, connected_ok, guarded,
+                         make_client, parse_json, start, stop)
 
 logger = logging.getLogger("mqtt_client")
 
-TASK_TOPIC_TEMPLATE = "robots/{robot_id}/{subsystem}/task"
-STATUS_TOPIC_WILDCARD = "robots/+/+/status"
-
 
 class SchedulerMQTTClient:
-    def __init__(self, broker_host: str = "localhost", broker_port: int = 1883,
-                 client_id: str = "task_scheduler",
-                 username: Optional[str] = None, password: Optional[str] = None,
+    def __init__(self, client_id: str = "task_scheduler",
                  on_status: Optional[Callable[[str, str, dict], None]] = None,
-                 on_instruction: Optional[Callable[[dict], None]] = None,
-                 instruction_topic: Optional[str] = None):
-        """
-        on_status: callback(robot_id, subsystem, payload_dict) for
-        robots/<id>/<subsystem>/status messages.
-
-        on_instruction: callback(instruction_dict) for new-task messages on
-        instruction_topic (defaults to config.INSTRUCTION_TOPIC). Pass None
-        if this client instance shouldn't listen for instructions at all
-        (e.g. a test harness that only cares about robot status).
-        """
-        import paho.mqtt.client as mqtt  # imported lazily so this module can be
-                                          # imported (e.g. for type hints/tests)
-                                          # on machines without paho-mqtt installed
-        self._client = mqtt.Client(client_id=client_id, clean_session=True)
-        if username:
-            self._client.username_pw_set(username, password)
-        self._client.on_connect = self._on_connect
-        self._client.on_message = self._on_message
+                 on_state: Optional[Callable[[str, str, dict], None]] = None,
+                 on_instruction: Optional[Callable[[object], None]] = None,
+                 on_command: Optional[Callable[[object], None]] = None,
+                 host: Optional[str] = None, port: Optional[int] = None):
+        self._client = make_client(client_id, clean_session=False)
+        self._client.on_connect = guarded(self._on_connect)
+        self._client.on_disconnect = guarded(self._on_disconnect)
+        self._client.on_message = guarded(self._on_message)
         self._on_status = on_status
+        self._on_state = on_state
         self._on_instruction = on_instruction
-        self._instruction_topic = instruction_topic or config.INSTRUCTION_TOPIC
-        self._host = broker_host
-        self._port = broker_port
+        self._on_command = on_command
+        self._host, self._port = host, port
+        self.connected = False
 
     def connect(self):
-        self._client.connect(self._host, self._port, keepalive=60)
-        self._client.loop_start()
+        start(self._client, self._host, self._port)
 
     def disconnect(self):
-        self._client.loop_stop()
-        self._client.disconnect()
+        stop(self._client)
 
-    def _on_connect(self, client, userdata, flags, rc):
-        logger.info("Connected to MQTT broker (rc=%s)", rc)
-        client.subscribe(STATUS_TOPIC_WILDCARD, qos=1)
+    # ---- callbacks -------------------------------------------------------------
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        if not connected_ok(reason_code):
+            logger.error("MQTT connect refused: %s", reason_code)
+            return
+        self.connected = True
+        logger.info("Connected to MQTT broker (session_present=%s)", flags.session_present)
+        subs = [(STATUS_TOPIC.format(robot_id="+", subsystem="+"), 1),
+                (STATE_TOPIC.format(robot_id="+", subsystem="+"), 1)]
         if self._on_instruction:
-            client.subscribe(self._instruction_topic, qos=1)
-            logger.info("Subscribed to instruction topic: %s", self._instruction_topic)
+            subs.append((config.INSTRUCTION_TOPIC, 1))
+        if self._on_command:
+            subs.append((config.COMMAND_TOPIC, 1))
+        client.subscribe(subs)
+
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties):
+        self.connected = False
+        logger.warning("Disconnected from MQTT broker (%s); auto-reconnecting", reason_code)
 
     def _on_message(self, client, userdata, msg):
-        try:
-            payload = json.loads(msg.payload.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            logger.warning("Ignoring non-JSON message on %s", msg.topic)
+        payload = parse_json(msg)
+        if payload is None:
             return
-
-        if msg.topic == self._instruction_topic:
+        if msg.topic == config.INSTRUCTION_TOPIC:
             if self._on_instruction:
                 self._on_instruction(payload)
             return
-
-        # topic shape: robots/<robot_id>/<subsystem>/status
+        if msg.topic == config.COMMAND_TOPIC:
+            if self._on_command:
+                self._on_command(payload)
+            return
         parts = msg.topic.split("/")
-        if len(parts) == 4 and parts[0] == "robots" and parts[3] == "status":
-            robot_id, subsystem = parts[1], parts[2]
-            if self._on_status:
+        if len(parts) == 4 and parts[0] == "robots":
+            robot_id, subsystem, kind = parts[1], parts[2], parts[3]
+            if kind == "status" and self._on_status:
                 self._on_status(robot_id, subsystem, payload)
+            elif kind == "state" and self._on_state:
+                self._on_state(robot_id, subsystem, payload)
 
-    def publish_task(self, robot_id: str, subsystem: str, subtask: dict, qos: int = 1):
-        topic = TASK_TOPIC_TEMPLATE.format(robot_id=robot_id, subsystem=subsystem)
-        payload = json.dumps(subtask)
-        logger.info("Publishing to %s: %s", topic, payload)
-        self._client.publish(topic, payload, qos=qos)
+    # ---- publishing --------------------------------------------------------------
+    def publish_task(self, robot_id: str, subsystem: str, subtask: dict):
+        topic = TASK_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
+        logger.info("-> %s %s#%s %s %s", topic, subtask["subtask_id"], subtask.get("attempt"),
+                    subtask["action"], subtask.get("zone"))
+        self._client.publish(topic, json.dumps(subtask), qos=1)
+
+    def publish_cancel(self, robot_id: str, subsystem: str, subtask_id: str, attempt: int, reason: str):
+        topic = TASK_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
+        payload = {"type": "cancel", "subtask_id": subtask_id, "attempt": attempt, "reason": reason}
+        logger.warning("-> %s CANCEL %s#%s (%s)", topic, subtask_id, attempt, reason)
+        self._client.publish(topic, json.dumps(payload), qos=1)
+
+    def publish_event(self, event: dict):
+        self._client.publish(config.EVENT_TOPIC, json.dumps(event, default=str), qos=1)
+
+    def publish_fleet_status(self, snapshot: dict):
+        self._client.publish(config.FLEET_STATUS_TOPIC, json.dumps(snapshot, default=str),
+                             qos=0, retain=True)

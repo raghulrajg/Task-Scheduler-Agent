@@ -1,27 +1,49 @@
 """
 robot_registry.py
 ------------------
-Loads robot fleet metadata and exposes the query/claim helpers the scheduler
-uses. Each entry in robots_metadata.json is ONE PHYSICAL ROBOT, which may
-have multiple SUBSYSTEMS with independent controllers/topics (e.g. an AMR
-base and a 6-DOF arm mounted on it). The robot as a whole is what gets
-locked idle/busy -- the AMR and arm on the same physical unit can't be
-double-booked by two different jobs even though they have separate topics,
-because moving the base and using the arm both belong to whichever task
-currently "owns" that robot.
+Fleet metadata plus live health, with atomic claim helpers.
 
-Concurrency: find_candidates() + claiming used to be two separate calls in
-an earlier version, which is a race condition -- two threads could both see
-the same robot as idle before either marked it busy. try_claim() below does
-the search-and-mark-busy as a single atomic operation under one lock, which
-is what makes it safe for multiple instructions to be submitted to the
-scheduler at the same time.
+Each entry in robots_metadata.json is ONE PHYSICAL ROBOT, which may have
+several SUBSYSTEMS with their own controllers/topics (e.g. a MiR base and a
+UR arm mounted on it). The robot as a whole is locked busy/idle, because the
+base and the arm belong to whichever task currently owns that robot.
+
+Two independent kinds of state per robot:
+
+  status   (owned by the scheduler)   idle | busy | error | maintenance
+           - error: something went wrong and a human must look at the robot
+             (e.g. it may still be holding a product). Only an operator
+             'reset_robot' command returns it to idle.
+           - maintenance: taken out of service by an operator.
+
+  health   (reported by robot agents, per subsystem, via heartbeats)
+           online / ready / estop / battery / last_seen
+           A robot is only allocatable when it is idle AND every subsystem
+           is online, ready, not e-stopped, recently seen, and above the
+           minimum battery level.
+
+try_claim() does the search and the mark-busy inside one lock, so two
+concurrent allocations can never both get the same robot.
 """
 
 import json
 import threading
+import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from typing import Any, Callable, Dict, List, Optional
+
+VALID_STATUSES = ("idle", "busy", "error", "maintenance")
+
+
+@dataclass
+class SubsystemHealth:
+    online: bool = False
+    ready: bool = False
+    estop: bool = False
+    battery: Optional[float] = None
+    busy: bool = False
+    detail: str = "no heartbeat yet"
+    last_seen: float = 0.0
 
 
 @dataclass
@@ -29,9 +51,14 @@ class Robot:
     id: str
     name: str
     type: str
-    subsystems: Dict[str, Dict[str, Any]]  # subsystem_key -> {topic, capabilities, manipulator?}
+    subsystems: Dict[str, Dict[str, Any]]  # key -> {topic, capabilities, manipulator?}
     zones: List[str] = field(default_factory=lambda: ["*"])
-    status: str = "idle"  # idle | busy | offline | error
+    status: str = "idle"
+    status_reason: str = ""
+    health: Dict[str, SubsystemHealth] = field(default_factory=dict)  # keyed by topic segment
+
+    def topics(self) -> List[str]:
+        return [sub["topic"] for sub in self.subsystems.values()]
 
     def has_capability(self, capability: str) -> bool:
         return any(capability in sub.get("capabilities", []) for sub in self.subsystems.values())
@@ -49,43 +76,68 @@ class Robot:
             return True
         return zone in self.zones
 
-    def is_available(self) -> bool:
-        return self.status == "idle"
-
     def subsystem_for_capability(self, capability: str) -> Optional[str]:
-        """Returns the MQTT topic segment for whichever subsystem provides this
-        capability, e.g. 'arm' for 'pick', 'amr' for 'navigate'."""
+        """MQTT topic segment of the subsystem providing this capability."""
         for sub in self.subsystems.values():
             if capability in sub.get("capabilities", []):
                 return sub["topic"]
+        return None
+
+    def health_problem(self, now: float, heartbeat_timeout_s: float,
+                       min_battery: float) -> Optional[str]:
+        """None if every subsystem is healthy, else a human-readable reason."""
+        for topic in self.topics():
+            h = self.health.get(topic)
+            if h is None or not h.online:
+                return f"{topic}: offline"
+            if now - h.last_seen > heartbeat_timeout_s:
+                return f"{topic}: heartbeat stale ({now - h.last_seen:.0f}s)"
+            if h.estop:
+                return f"{topic}: emergency stop active"
+            if not h.ready:
+                return f"{topic}: not ready ({h.detail})"
+            if h.battery is not None and h.battery < min_battery:
+                return f"{topic}: battery {h.battery:.0f}% < {min_battery:.0f}%"
         return None
 
 
 class RobotRegistry:
     """Thread-safe in-memory registry of robots, backed by a JSON file."""
 
-    def __init__(self, metadata_path: str):
+    def __init__(self, metadata_path: str, require_heartbeat: bool = True,
+                 heartbeat_timeout_s: float = 15.0, min_battery_percent: float = 25.0,
+                 clock: Callable[[], float] = time.time):
         self._path = metadata_path
+        self._clock = clock
         self._lock = threading.Lock()
         self._robots: Dict[str, Robot] = {}
-        self.reload()
+        self.require_heartbeat = require_heartbeat
+        self.heartbeat_timeout_s = heartbeat_timeout_s
+        self.min_battery_percent = min_battery_percent
+        self._load()
 
-    def reload(self):
+    def _load(self):
         with open(self._path, "r") as f:
             data = json.load(f)
+        robots = {}
+        for r in data.get("robots", []):
+            if r["id"] in robots:
+                raise ValueError(f"duplicate robot id {r['id']!r} in {self._path}")
+            status = r.get("status", "idle")
+            robots[r["id"]] = Robot(
+                id=r["id"],
+                name=r.get("name", r["id"]),
+                type=r.get("type", "generic"),
+                subsystems=r.get("subsystems", {}),
+                zones=r.get("zones", ["*"]),
+                # 'busy' in a metadata file is meaningless at startup; only
+                # maintenance is honoured as a static setting.
+                status="maintenance" if status == "maintenance" else "idle",
+            )
         with self._lock:
-            self._robots = {
-                r["id"]: Robot(
-                    id=r["id"],
-                    name=r["name"],
-                    type=r.get("type", "generic"),
-                    subsystems=r.get("subsystems", {}),
-                    zones=r.get("zones", ["*"]),
-                    status=r.get("status", "idle"),
-                )
-                for r in data.get("robots", [])
-            }
+            self._robots = robots
 
+    # ---- queries -------------------------------------------------------------
     def all(self) -> List[Robot]:
         with self._lock:
             return list(self._robots.values())
@@ -94,14 +146,25 @@ class RobotRegistry:
         with self._lock:
             return self._robots.get(robot_id)
 
-    def subsystem_topic(self, robot_id: str, capability: str) -> Optional[str]:
+    def zones_with_capability(self, capability: str) -> List[str]:
         with self._lock:
-            robot = self._robots.get(robot_id)
-            return robot.subsystem_for_capability(capability) if robot else None
+            zones = set()
+            for r in self._robots.values():
+                if r.has_capability(capability):
+                    zones.update(r.zones)
+            return sorted(zones)
 
-    def _matches(self, robot: Robot, required_capabilities: List[str],
-                 zone: Optional[str], require_manipulator: Optional[bool]) -> bool:
-        if not robot.is_available():
+    def is_allocatable(self, robot: Robot, now: Optional[float] = None) -> bool:
+        if robot.status != "idle":
+            return False
+        if not self.require_heartbeat:
+            return True
+        now = self._clock() if now is None else now
+        return robot.health_problem(now, self.heartbeat_timeout_s, self.min_battery_percent) is None
+
+    def _matches(self, robot: Robot, required_capabilities: List[str], zone: Optional[str],
+                 require_manipulator: Optional[bool], now: float) -> bool:
+        if not self.is_allocatable(robot, now):
             return False
         if not all(robot.has_capability(c) for c in required_capabilities):
             return False
@@ -112,34 +175,85 @@ class RobotRegistry:
                 return False
         return True
 
-    def try_claim(self, required_capabilities: List[str],
-                   zone: Optional[str] = None,
-                   require_manipulator: Optional[bool] = None) -> Optional[Robot]:
-        """Atomically find an idle, capable robot and mark it busy in one step.
-        Returns None if nothing currently qualifies (caller should treat this
-        as 'try again later', not a hard failure)."""
+    # ---- claims ------------------------------------------------------------------
+    def try_claim(self, required_capabilities: List[str], zone: Optional[str] = None,
+                  require_manipulator: Optional[bool] = None) -> Optional[Robot]:
+        """Atomically find an allocatable, capable robot and mark it busy.
+        Among candidates, prefers the one with the most battery left.
+        Returns None if nothing qualifies right now (retry later)."""
+        now = self._clock()
         with self._lock:
-            for robot in self._robots.values():
-                if self._matches(robot, required_capabilities, zone, require_manipulator):
-                    robot.status = "busy"
-                    return robot
-        return None
+            candidates = [r for r in self._robots.values()
+                          if self._matches(r, required_capabilities, zone, require_manipulator, now)]
+            if not candidates:
+                return None
+            robot = max(candidates, key=lambda r: min(
+                [h.battery for h in r.health.values() if h.battery is not None] or [100.0]))
+            robot.status = "busy"
+            robot.status_reason = ""
+            return robot
 
-    def try_claim_specific(self, robot_id: str) -> Optional[Robot]:
-        """Atomically claim a SPECIFIC robot (used when a task must keep using
-        the same physical robot for its next step). Returns None if that
-        robot is not idle right now."""
+    # ---- status changes ------------------------------------------------------------
+    def set_status(self, robot_id: str, status: str, reason: str = ""):
+        if status not in VALID_STATUSES:
+            raise ValueError(f"invalid robot status {status!r}")
         with self._lock:
             robot = self._robots.get(robot_id)
-            if robot and robot.is_available():
-                robot.status = "busy"
-                return robot
-        return None
-
-    def set_status(self, robot_id: str, status: str):
-        with self._lock:
-            if robot_id in self._robots:
-                self._robots[robot_id].status = status
+            if robot:
+                robot.status = status
+                robot.status_reason = reason
 
     def mark_idle(self, robot_id: str):
         self.set_status(robot_id, "idle")
+
+    # ---- health (heartbeats from robot agents) ------------------------------------
+    def update_health(self, robot_id: str, topic: str, payload: Dict[str, Any],
+                      now: Optional[float] = None) -> bool:
+        """Apply a heartbeat. Returns True if the robot's allocatability might
+        have changed (so the caller can retry pending work)."""
+        now = self._clock() if now is None else now
+        with self._lock:
+            robot = self._robots.get(robot_id)
+            if robot is None or topic not in robot.topics():
+                return False
+            h = robot.health.setdefault(topic, SubsystemHealth())
+            before = robot.health_problem(now, self.heartbeat_timeout_s, self.min_battery_percent)
+            h.online = bool(payload.get("online", False))
+            h.ready = bool(payload.get("ready", False)) and h.online
+            h.estop = bool(payload.get("estop", False))
+            h.busy = bool(payload.get("busy", False))
+            battery = payload.get("battery")
+            h.battery = float(battery) if isinstance(battery, (int, float)) else None
+            h.detail = str(payload.get("detail", ""))[:200]
+            h.last_seen = now
+            after = robot.health_problem(now, self.heartbeat_timeout_s, self.min_battery_percent)
+            return (before is None) != (after is None)
+
+    # ---- persistence helpers --------------------------------------------------------
+    def snapshot_statuses(self) -> Dict[str, Dict[str, str]]:
+        with self._lock:
+            return {r.id: {"status": r.status, "reason": r.status_reason} for r in self._robots.values()}
+
+    def restore_statuses(self, statuses: Dict[str, Dict[str, str]]):
+        with self._lock:
+            for rid, s in statuses.items():
+                robot = self._robots.get(rid)
+                if robot and s.get("status") in VALID_STATUSES:
+                    robot.status = s["status"]
+                    robot.status_reason = s.get("reason", "")
+
+    def fleet_view(self, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        now = self._clock() if now is None else now
+        with self._lock:
+            out = []
+            for r in self._robots.values():
+                problem = r.health_problem(now, self.heartbeat_timeout_s, self.min_battery_percent)
+                out.append({
+                    "id": r.id, "name": r.name, "status": r.status, "reason": r.status_reason,
+                    "healthy": problem is None, "health_problem": problem,
+                    "subsystems": {t: {"online": h.online, "ready": h.ready, "estop": h.estop,
+                                       "battery": h.battery, "detail": h.detail,
+                                       "age_s": round(now - h.last_seen, 1) if h.last_seen else None}
+                                   for t, h in r.health.items()},
+                })
+            return out

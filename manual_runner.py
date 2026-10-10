@@ -1,11 +1,10 @@
 """
 manual_runner.py
-------------------
-Runs the scheduler stand-alone, with NO ROS2 dependency, for testing against
-a real MQTT broker before the reasoning agent is wired in. You supply the
-instruction JSON yourself (either the default below, or via a file path arg).
-
-Broker settings come from config.py (env vars / .env), not hardcoded here.
+----------------
+Submit ONE instruction to the running scheduler_service.py and follow it
+until it completes or fails. (Earlier versions started a second, private
+scheduler instance -- two schedulers dispatching to the same robots is
+unsafe, so this now only talks to the real one over MQTT.)
 
 Usage:
     python3 manual_runner.py
@@ -14,15 +13,12 @@ Usage:
 
 import json
 import sys
+import threading
 import time
-import logging
+import uuid
 
 import config
-from robot_registry import RobotRegistry
-from mqtt_client import SchedulerMQTTClient
-from scheduler import TaskScheduler
-
-logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+from mqtt_common import make_client, parse_json, start, stop
 
 DEFAULT_INSTRUCTION = {
     "product": "ABCD",
@@ -31,51 +27,48 @@ DEFAULT_INSTRUCTION = {
     "success_dest": "package_area",
     "fail_dest": "waste_area",
 }
-
-
-def load_instruction() -> dict:
-    if len(sys.argv) > 1:
-        with open(sys.argv[1], "r") as f:
-            return json.load(f)
-    return DEFAULT_INSTRUCTION
+FINAL = ("task_completed", "task_failed", "task_cancelled", "task_rejected")
 
 
 def main():
-    registry = RobotRegistry(config.ROBOT_METADATA_PATH)
-    state = {"task_id": None}
+    instruction = DEFAULT_INSTRUCTION
+    if len(sys.argv) > 1:
+        with open(sys.argv[1]) as f:
+            instruction = json.load(f)
+    request_id = uuid.uuid4().hex[:8]
+    instruction = {**instruction, "request_id": request_id}
 
-    def on_status(robot_id, subsystem, payload):
-        scheduler.on_robot_status(robot_id, subsystem, payload)
-        if state["task_id"] and scheduler._task_complete(state["task_id"]):
-            print(f"\nTask {state['task_id']} complete.")
+    finished = threading.Event()
+    connected = threading.Event()
+    client = make_client(f"manual_runner_{request_id}", clean_session=True)
 
-    mqtt_client = SchedulerMQTTClient(
-        broker_host=config.MQTT_BROKER_HOST,
-        broker_port=config.MQTT_BROKER_PORT,
-        client_id="task_scheduler_manual",
-        username=config.MQTT_USERNAME,
-        password=config.MQTT_PASSWORD,
-        on_status=on_status,
-    )
-    scheduler = TaskScheduler(registry, mqtt_client)
+    def on_connect(c, u, flags, rc, props):
+        c.subscribe(config.EVENT_TOPIC, qos=1)
+        connected.set()
 
-    print(f"Connecting to {config.MQTT_BROKER_HOST}:{config.MQTT_BROKER_PORT} as {config.MQTT_USERNAME} ...")
-    mqtt_client.connect()
-    time.sleep(1)  # give the connect/subscribe handshake a moment
+    def on_message(c, u, msg):
+        ev = parse_json(msg)
+        if not isinstance(ev, dict) or ev.get("request_id") != request_id:
+            return
+        print(f"{time.strftime('%H:%M:%S')} {ev.get('event'):20} "
+              f"{json.dumps({k: v for k, v in ev.items() if k not in ('event', 'ts', 'request_id')})}")
+        if ev.get("event") in FINAL:
+            finished.set()
 
-    instruction = load_instruction()
-    print("Submitting instruction:", instruction)
-    state["task_id"] = scheduler.submit_instruction(instruction)
-    print(f"Task id: {state['task_id']}")
-    print("Watching for robots/+/+/status acks. Ctrl+C to stop.\n")
-
+    client.on_connect = on_connect
+    client.on_message = on_message
+    start(client)
+    if not connected.wait(10):
+        sys.exit("Could not connect to the MQTT broker")
+    print("Submitting:", instruction)
+    client.publish(config.INSTRUCTION_TOPIC, json.dumps(instruction), qos=1)
     try:
-        while True:
-            time.sleep(1)
+        while not finished.wait(1):
+            pass
     except KeyboardInterrupt:
         pass
     finally:
-        mqtt_client.disconnect()
+        stop(client)
 
 
 if __name__ == "__main__":

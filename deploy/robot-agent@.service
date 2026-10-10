@@ -1,0 +1,23 @@
+# Template unit: one instance per robot subsystem, named after its config file.
+#   agents/robot_01_amr.json  ->  sudo systemctl enable --now robot-agent@robot_01_amr
+#   agents/robot_01_arm.json  ->  sudo systemctl enable --now robot-agent@robot_01_arm
+#   agents/qc_01_scanner.json ->  sudo systemctl enable --now robot-agent@qc_01_scanner
+# Install: sudo cp deploy/robot-agent@.service /etc/systemd/system/ && sudo systemctl daemon-reload
+[Unit]
+Description=Robot subsystem agent (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fleet
+WorkingDirectory=/opt/robot-fleet
+EnvironmentFile=/opt/robot-fleet/.env
+ExecStart=/opt/robot-fleet/venv/bin/python robot_agent.py --config agents/%i.json
+Restart=always
+RestartSec=3
+# SIGTERM -> agent cancels the running action on the hardware before exiting
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

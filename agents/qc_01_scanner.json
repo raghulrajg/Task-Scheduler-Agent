@@ -1,0 +1,17 @@
+{
+  "_comment": "QC vision station qc_01. Use type http_inspection for a vision service with an HTTP endpoint, or tcp_inspection for a camera with a trigger/OK-NG socket protocol (see drivers/inspection.py).",
+  "robot_id": "qc_01",
+  "subsystem": "scanner",
+  "heartbeat_s": 5,
+  "interlock_with": [],
+  "driver": {
+    "type": "http_inspection",
+    "trigger_url": "http://192.168.12.30:8080/inspect",
+    "method": "POST",
+    "pass_field": "result.pass",
+    "pass_values": [true, "OK", "PASS"],
+    "fail_values": [false, "NG", "FAIL"],
+    "health_url": "http://192.168.12.30:8080/health",
+    "timeout_s": 30
+  }
+}

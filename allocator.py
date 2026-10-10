@@ -1,25 +1,19 @@
 """
 allocator.py
 ------------
-Thin wrapper around RobotRegistry.try_claim for a single subtask. The actual
-atomicity lives in the registry (one lock, search+claim together) -- this
-class just translates "here's a subtask" into "here's what to ask the
-registry for".
+Thin wrapper around RobotRegistry.try_claim for a single subtask. Atomicity
+lives in the registry (one lock, search + claim together).
 
-Sticky continuation (keeping the same physical robot across a task's own
-navigate/pick/navigate/place sequence) is handled in scheduler.py, not here --
-this module only knows about single, one-off allocations.
+Sticky continuation (the same physical robot for a task's whole
+navigate/pick/navigate/place chain) is handled in scheduler.py.
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from robot_registry import RobotRegistry, Robot
 
 
 class AllocationError(Exception):
-    """Raised when nothing currently idle can satisfy a subtask. Callers
-    should treat this as retryable (the fleet is just busy right now), not
-    as a permanent failure -- see scheduler.py's retry queue."""
-    pass
+    """Nothing allocatable right now. Retryable -- see scheduler's pending queue."""
 
 
 class TaskAllocator:
@@ -34,7 +28,7 @@ class TaskAllocator:
         )
         if robot is None:
             raise AllocationError(
-                f"No idle robot currently satisfies subtask {subtask['subtask_id']} "
+                f"No allocatable robot for subtask {subtask['subtask_id']} "
                 f"(requires={subtask['requires']}, zone={subtask.get('zone')}, "
                 f"manipulator={subtask.get('require_manipulator')})"
             )

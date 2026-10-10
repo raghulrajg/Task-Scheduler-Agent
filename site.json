@@ -1,0 +1,32 @@
+{
+  "_comment": "Site-wide settings shared by scheduler_service.py and reasoning_agent.py. Location names here are the ONLY names the LLM may use and the only ones the scheduler will accept. Each robot agent maps these names to its own vendor targets (MiR mission GUIDs, UR programs) in agents/*.json.",
+
+  "locations": {
+    "manufacturing_1": { "description": "Output of manufacturing cell 1 (pick-up point)" },
+    "quality_station": { "description": "Vision inspection station" },
+    "package_area":    { "description": "Packaging drop-off for parts that passed QC" },
+    "waste_area":      { "description": "Reject bin for parts that failed QC" },
+    "rest_position":   { "description": "Robot parking / charging position" }
+  },
+
+  "timeouts_s": {
+    "accept": 30,
+    "navigate": 300,
+    "pick": 120,
+    "place": 120,
+    "quality_check": 90
+  },
+
+  "max_retries": {
+    "navigate": 1,
+    "pick": 1,
+    "place": 0,
+    "quality_check": 1
+  },
+
+  "max_task_reassignments": 2,
+  "min_battery_percent": 25,
+  "heartbeat_timeout_s": 15,
+  "startup_grace_s": 30,
+  "finished_task_retention": 200
+}

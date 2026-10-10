@@ -1,0 +1,38 @@
+# Mosquitto ACL: least privilege per role. Copy to /etc/mosquitto/acl.
+# Create users:  sudo mosquitto_passwd /etc/mosquitto/passwd <username>
+# %u in a pattern is the connecting username, so name robot accounts after
+# their robot_id (robot_01, qc_01, ...) and one account covers all of that
+# robot's subsystems.
+
+# --- scheduler: the only client allowed to send tasks to robots
+user scheduler
+topic read  scheduler/instructions
+topic read  scheduler/commands
+topic write scheduler/events
+topic write scheduler/status
+topic write robots/+/+/task
+topic read  robots/+/+/status
+topic read  robots/+/+/state
+
+# --- reasoning agent
+user reasoning
+topic read  hmi/user_prompt
+topic read  hmi/confirm
+topic write hmi/feedback
+topic write scheduler/instructions
+
+# --- HMI / operator console
+user hmi
+topic write hmi/user_prompt
+topic write hmi/confirm
+topic read  hmi/feedback
+topic write scheduler/commands
+topic write scheduler/instructions
+topic read  scheduler/events
+topic read  scheduler/status
+topic read  robots/+/+/state
+
+# --- robot agents: each robot may only touch its own topics
+pattern read  robots/%u/+/task
+pattern write robots/%u/+/status
+pattern readwrite robots/%u/+/state

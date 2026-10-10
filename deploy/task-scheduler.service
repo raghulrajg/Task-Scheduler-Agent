@@ -1,20 +1,21 @@
-# Example systemd unit for the scheduler process.
+# systemd unit for the scheduler. Run exactly ONE per site.
 # Install: sudo cp deploy/task-scheduler.service /etc/systemd/system/
-#          sudo systemctl daemon-reload
-#          sudo systemctl enable --now task-scheduler
+#          sudo systemctl daemon-reload && sudo systemctl enable --now task-scheduler
 [Unit]
-Description=Task planning and scheduling agent (MQTT dispatcher)
-After=network-online.target
+Description=Robot task scheduler (MQTT dispatcher)
+After=network-online.target mosquitto.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=sam
-WorkingDirectory=/home/sam/task_scheduler_pkg
-EnvironmentFile=/home/sam/task_scheduler_pkg/.env
-ExecStart=/usr/bin/python3 /home/sam/task_scheduler_pkg/scheduler_service.py
-Restart=on-failure
-RestartSec=5
+User=fleet
+WorkingDirectory=/opt/robot-fleet
+EnvironmentFile=/opt/robot-fleet/.env
+ExecStart=/opt/robot-fleet/venv/bin/python scheduler_service.py
+Restart=always
+RestartSec=3
+# Give in-flight work time to be persisted on shutdown
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

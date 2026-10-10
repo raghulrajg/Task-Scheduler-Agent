@@ -1,150 +1,325 @@
 """
 robot_agent.py
 --------------
-Runs ON the robot's onboard PC (or the controller box for that subsystem).
-One process per subsystem: it subscribes to that subsystem's own task
-topic, and YOU wire execute_task() to your real hardware calls (Nav2 goal,
-MoveIt pick, a vision-station gRPC call, whatever your controller exposes).
-When the action finishes, it publishes the status ack the scheduler is
-waiting for -- that's the whole contract.
+Bridges one robot SUBSYSTEM (a MiR base, a UR arm, a QC camera) to the
+scheduler over MQTT. Run one process per subsystem. With vendor REST/TCP
+APIs it does not have to run on the robot itself -- any PC that can reach
+both the broker and the robot controller works.
 
-This is the missing piece that makes the earlier diagram a closed loop
-instead of just the scheduler's half of it. execute_task() below is ported
-from your manipulator_control_node.py's navigate_to()/actuate_gripper()
-logic -- the same simulated timing and (for the QC subsystem) the same
-random pass/fail placeholder you had, just split per action instead of one
-node running the whole job.
+Topic contract (per robot_id / subsystem):
+  robots/<id>/<sub>/task    (sub)  {"type":"task", subtask...} | {"type":"cancel", subtask_id, attempt}
+  robots/<id>/<sub>/status  (pub)  {"subtask_id","attempt","state":"accepted"|"done"|"failed"|"cancelled", ...}
+                                   terminal statuses are retained so a restarted scheduler still sees them
+  robots/<id>/<sub>/state   (pub)  retained heartbeat {"online","ready","estop","battery","busy",...}
+                                   + last-will {"online": false} if this process dies
+  robots/<id>/+/state       (sub)  sibling heartbeats, for the arm/base software interlock
+
+What this process guarantees:
+  * the hardware action runs in a worker thread, so the MQTT connection
+    stays alive and a cancel is processed while the robot is moving;
+  * a task delivered twice (QoS 1) is executed once; the stored result is
+    re-sent instead;
+  * a stale task (delivered after its accept deadline, e.g. queued while
+    the robot was off Wi-Fi and already failed over) is refused;
+  * a subtask is refused while a sibling subsystem on the same robot is
+    busy (arm won't start while the base is driving, and vice versa).
+    This is a SOFTWARE interlock only -- the real one belongs in the robot
+    controllers / safety PLC.
 
 Run:
-    python3 robot_agent.py --robot-id robot_01 --subsystem amr
-    python3 robot_agent.py --robot-id robot_01 --subsystem arm
-    python3 robot_agent.py --robot-id qc_01     --subsystem scanner
-
-Each subsystem controller on each physical robot runs its own instance of
-this script (or your own equivalent implementing the same topic contract).
+    python3 robot_agent.py --config agents/robot_01_amr.json
+    python3 robot_agent.py --config agents/robot_01_amr.json --check            # print driver state
+    python3 robot_agent.py --config agents/robot_01_amr.json --test navigate manufacturing_1
+    python3 robot_agent.py --robot-id robot_01 --subsystem amr                    # simulator
 """
 
 import argparse
 import json
 import logging
-import random
+import os
+import signal
+import threading
 import time
-from typing import Dict, Any
+from collections import OrderedDict
+from typing import Any, Dict, Optional, Tuple
 
 import config
+from drivers import create_driver
+from drivers.base import Driver, failed
+from mqtt_common import (STATE_TOPIC, STATUS_TOPIC, TASK_TOPIC, connected_ok, guarded, make_client,
+                         parse_json, start, stop)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("robot_agent")
 
-TASK_TOPIC_TEMPLATE = "robots/{robot_id}/{subsystem}/task"
-STATUS_TOPIC_TEMPLATE = "robots/{robot_id}/{subsystem}/status"
-
-
-def navigate_to(target: str):
-    """Ported from manipulator_control_node.py's navigate_to(). Replace the
-    sleep with your real Nav2 goal call -- keep the same signature/return."""
-    logger.info("Navigating mobile base to: %s...", target)
-    time.sleep(1)
-
-
-def actuate_gripper(action: str):
-    """Ported from manipulator_control_node.py's actuate_gripper(). Replace
-    the sleep with your real MoveIt/IK call."""
-    logger.info("6-DOF arm executing IK for: %s", action.upper())
-    time.sleep(1)
-
-
-def run_quality_check() -> bool:
-    """Ported from manipulator_control_node.py's simulated QC step
-    (random.choice). Replace with a real subscriber/call to your vision
-    sensor -- this is the one placeholder you explicitly flagged as
-    temporary in the original script."""
-    time.sleep(2)
-    return random.choice([True, False])
-
-
-def execute_task(subtask: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Dispatches to the right simulated (for now) hardware call based on the
-    subtask's action. Each of navigate_to/actuate_gripper/run_quality_check
-    above is the one function to replace with a real call for that
-    subsystem -- this function itself shouldn't need to change.
-
-    Must return a dict with at least {"state": "done"|"failed"}. For
-    action == "quality_check", also include {"result": {"pass": bool}} --
-    that's what the scheduler reads to pick the success/fail branch.
-    """
-    action = subtask["action"]
-    logger.info("Executing %s: target=%s zone=%s", action, subtask.get("target"), subtask.get("zone"))
-
-    try:
-        if action == "navigate":
-            navigate_to(subtask.get("zone"))
-        elif action in ("pick", "place"):
-            actuate_gripper(action)
-        elif action == "quality_check":
-            passed = run_quality_check()
-            state = "PASS (OK)" if passed else "FAIL (BAD)"
-            logger.info("--- QUALITY CHECK RESULT: %s ---", state)
-            return {"state": "done", "result": {"pass": passed}}
-        else:
-            return {"state": "failed", "error": f"unknown action: {action}"}
-    except Exception as e:
-        return {"state": "failed", "error": str(e)}
-
-    return {"state": "done"}
+TERMINAL = ("done", "failed", "cancelled")
+RESULT_CACHE = 500
 
 
 class RobotAgent:
-    def __init__(self, robot_id: str, subsystem: str):
-        import paho.mqtt.client as mqtt
-        self.robot_id = robot_id
-        self.subsystem = subsystem
-        self.task_topic = TASK_TOPIC_TEMPLATE.format(robot_id=robot_id, subsystem=subsystem)
-        self.status_topic = STATUS_TOPIC_TEMPLATE.format(robot_id=robot_id, subsystem=subsystem)
+    def __init__(self, robot_id: str, subsystem: str, driver: Driver,
+                 heartbeat_s: float = 5.0, interlock_with: Tuple[str, ...] = (),
+                 clock_skew_tolerance_s: float = 5.0, client_id: Optional[str] = None,
+                 host: Optional[str] = None, port: Optional[int] = None):
+        self.robot_id, self.subsystem, self.driver = robot_id, subsystem, driver
+        self.heartbeat_s = heartbeat_s
+        self.interlock_with = tuple(interlock_with)
+        self.skew = clock_skew_tolerance_s
+        self.task_topic = TASK_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
+        self.status_topic = STATUS_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
+        self.state_topic = STATE_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
+        self._sibling_filter = STATE_TOPIC.format(robot_id=robot_id, subsystem="+")
 
-        self._client = mqtt.Client(client_id=f"agent_{robot_id}_{subsystem}", clean_session=True)
-        if config.MQTT_USERNAME:
-            self._client.username_pw_set(config.MQTT_USERNAME, config.MQTT_PASSWORD)
-        self._client.on_connect = self._on_connect
-        self._client.on_message = self._on_message
+        self._lock = threading.RLock()
+        self._current: Optional[Dict[str, Any]] = None       # {"key","thread","cancel","subtask"}
+        self._results: "OrderedDict[Tuple[str,int], dict]" = OrderedDict()
+        self._siblings: Dict[str, Dict[str, Any]] = {}
+        self._stop = threading.Event()
+        self._driver_state: Dict[str, Any] = {}
+        self._host, self._port = host, port
 
-    def _on_connect(self, client, userdata, flags, rc):
-        logger.info("Connected (rc=%s). Subscribing to %s", rc, self.task_topic)
-        client.subscribe(self.task_topic, qos=1)
+        self._client = make_client(client_id or f"agent_{robot_id}_{subsystem}", clean_session=False,
+                                   will_topic=self.state_topic,
+                                   will_payload={"online": False, "ready": False,
+                                                 "detail": "agent connection lost (last will)"})
+        self._client.on_connect = guarded(self._on_connect)
+        self._client.on_message = guarded(self._on_message)
+
+    # ---- MQTT ---------------------------------------------------------------------
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        if not connected_ok(reason_code):
+            logger.error("MQTT connect refused: %s", reason_code)
+            return
+        logger.info("Connected (session_present=%s); listening on %s", flags.session_present, self.task_topic)
+        subs = [(self.task_topic, 1)]
+        if self.interlock_with:
+            subs.append((self._sibling_filter, 1))
+        client.subscribe(subs)
+        self._publish_heartbeat(refresh=False)
 
     def _on_message(self, client, userdata, msg):
-        try:
-            subtask = json.loads(msg.payload.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            logger.error("Bad JSON on %s: %r", msg.topic, msg.payload)
+        if msg.topic == self.task_topic:
+            payload = parse_json(msg)
+            if not isinstance(payload, dict):
+                logger.error("Ignoring malformed task message: %r", msg.payload[:200])
+                return
+            if payload.get("type", "task") == "cancel":
+                self._handle_cancel(payload)
+            else:
+                self._handle_task(payload)
             return
+        parts = msg.topic.split("/")
+        if len(parts) == 4 and parts[3] == "state" and parts[2] != self.subsystem:
+            payload = parse_json(msg)
+            if isinstance(payload, dict):
+                self._siblings[parts[2]] = payload
 
-        logger.info("Received subtask %s", subtask.get("subtask_id"))
+    def _publish_status(self, payload: Dict[str, Any], retain: bool = False):
+        self._client.publish(self.status_topic, json.dumps(payload), qos=1, retain=retain)
+        logger.info("<- %s %s#%s %s %s", self.status_topic, payload.get("subtask_id"),
+                    payload.get("attempt"), payload["state"], payload.get("error", ""))
+
+    def _publish_heartbeat(self, refresh: bool = True):
+        """refresh=False re-sends the last driver state with an updated busy
+        flag -- used from the MQTT thread, where a slow vendor API call
+        would stall the connection."""
+        if refresh or not self._driver_state:
+            try:
+                self._driver_state = self.driver.get_state()
+            except Exception as e:  # a driver bug must not kill the heartbeat
+                self._driver_state = {"ready": False, "detail": f"get_state error: {e}",
+                                      "estop": False, "battery": None}
+        st = self._driver_state
+        with self._lock:
+            current = self._current["key"][0] if self._current else None
+        payload = {"online": True, "ready": bool(st.get("ready")), "estop": bool(st.get("estop")),
+                   "battery": st.get("battery"), "detail": st.get("detail", ""),
+                   "busy": current is not None, "current": current, "ts": time.time()}
+        self._client.publish(self.state_topic, json.dumps(payload), qos=1, retain=True)
+
+    # ---- task handling ---------------------------------------------------------------
+    def _interlock_problem(self) -> Optional[str]:
+        for sib in self.interlock_with:
+            st = self._siblings.get(sib)
+            if st is None:
+                return f"interlock: no state received from sibling '{sib}'"
+            if not st.get("online", False):
+                return f"interlock: sibling '{sib}' is offline"
+            if st.get("busy"):
+                return f"interlock: sibling '{sib}' is busy with {st.get('current')}"
+        return None
+
+    def _handle_task(self, task: Dict[str, Any]):
+        sid, action = task.get("subtask_id"), task.get("action")
+        attempt = task.get("attempt", 1)
+        if not isinstance(sid, str) or not isinstance(action, str):
+            logger.error("Task without subtask_id/action: %r", task)
+            return
+        key = (sid, attempt)
+        base = {"subtask_id": sid, "attempt": attempt}
+
+        with self._lock:
+            if key in self._results:  # duplicate delivery after we finished
+                logger.info("Duplicate task %s#%s -- re-sending stored result", sid, attempt)
+                self._publish_status(self._results[key], retain=True)
+                return
+            if self._current and self._current["key"] == key:  # duplicate while running
+                self._publish_status({**base, "state": "accepted"})
+                return
+            reject = None
+            if self._current:
+                reject = f"busy with {self._current['key'][0]}"
+            elif action not in self.driver.actions:
+                reject = f"action {action!r} not supported by {self.subsystem} ({self.driver.actions})"
+            else:
+                expires = task.get("expires_at")
+                if isinstance(expires, (int, float)) and time.time() > expires + self.skew:
+                    reject = (f"stale task: arrived {time.time() - expires:.0f}s after its accept "
+                              f"deadline (robot was offline, or clocks are not NTP-synced)")
+                else:
+                    reject = self._interlock_problem()
+            if reject:
+                result = {**base, **failed(reject)}
+                self._remember(key, result)
+                self._publish_status(result, retain=True)
+                return
+            cancel = threading.Event()
+            worker = threading.Thread(target=self._run, args=(task, key, cancel),
+                                      name=f"task-{sid}", daemon=True)
+            self._current = {"key": key, "thread": worker, "cancel": cancel, "subtask": task}
+            self._publish_heartbeat(refresh=False)  # siblings see busy=True before anything moves
+            self._publish_status({**base, "state": "accepted"})
+            worker.start()
+
+    def _run(self, task: Dict[str, Any], key, cancel: threading.Event):
+        sid, attempt = key
+        logger.info("Executing %s#%s: %s at %s", sid, attempt, task["action"], task.get("zone"))
         try:
-            result = execute_task(subtask)
+            outcome = self.driver.execute(task, cancel)
+            if not isinstance(outcome, dict) or outcome.get("state") not in TERMINAL:
+                outcome = failed(f"driver returned invalid outcome {outcome!r}")
         except Exception as e:
-            logger.exception("execute_task raised for subtask %s", subtask.get("subtask_id"))
-            result = {"state": "failed", "error": str(e)}
+            logger.exception("Driver crashed on %s", sid)
+            outcome = failed(f"driver exception: {e}")
+        result = {"subtask_id": sid, "attempt": attempt, **outcome}
+        with self._lock:
+            self._remember(key, result)
+            self._current = None
+        # Heartbeat (busy=False) goes out BEFORE the result: the scheduler only
+        # dispatches the sibling's next step after seeing the result, so the
+        # sibling's interlock already knows we're idle.
+        self._publish_heartbeat(refresh=False)
+        self._publish_status(result, retain=True)
 
-        payload = {"subtask_id": subtask["subtask_id"], **result}
-        client.publish(self.status_topic, json.dumps(payload), qos=1)
-        logger.info("Published status to %s: %s", self.status_topic, payload)
+    def _handle_cancel(self, msg: Dict[str, Any]):
+        key = (msg.get("subtask_id"), msg.get("attempt", 1))
+        with self._lock:
+            if self._current and self._current["key"] == key:
+                logger.warning("Cancelling %s#%s: %s", key[0], key[1], msg.get("reason"))
+                self._current["cancel"].set()
+                cancel_hw = True
+            else:
+                cancel_hw = False
+                if key not in self._results:
+                    # Cancel for something we never started: remember it so a
+                    # late-arriving copy of that task is refused.
+                    self._remember(key, {"subtask_id": key[0], "attempt": key[1], "state": "cancelled",
+                                         "error": f"cancelled before start: {msg.get('reason')}"})
+        if cancel_hw:
+            try:
+                self.driver.cancel()
+            except Exception:
+                logger.exception("driver.cancel() failed")
+
+    def _remember(self, key, result):
+        self._results[key] = result
+        while len(self._results) > RESULT_CACHE:
+            self._results.popitem(last=False)
+
+    # ---- lifecycle ---------------------------------------------------------------------
+    def start(self):
+        start(self._client, self._host, self._port)
 
     def run_forever(self):
-        logger.info("Connecting to %s:%s as %s ...", config.MQTT_BROKER_HOST,
-                    config.MQTT_BROKER_PORT, config.MQTT_USERNAME)
-        self._client.connect(config.MQTT_BROKER_HOST, config.MQTT_BROKER_PORT, keepalive=60)
-        self._client.loop_forever()  # blocks; auto-reconnects on drop
+        signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
+        self.start()
+        try:
+            while not self._stop.wait(self.heartbeat_s):
+                self._publish_heartbeat()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.shutdown()
+
+    def shutdown(self):
+        self._stop.set()
+        with self._lock:
+            current = self._current
+        if current:
+            logger.warning("Shutting down while executing %s -- cancelling", current["key"][0])
+            current["cancel"].set()
+            try:
+                self.driver.cancel()
+            except Exception:
+                pass
+            current["thread"].join(timeout=10)
+        self._client.publish(self.state_topic, json.dumps(
+            {"online": False, "ready": False, "detail": "agent stopped", "ts": time.time()}),
+            qos=1, retain=True)
+        time.sleep(0.2)
+        stop(self._client)
+        self.driver.close()
+
+
+def load_agent_config(path: str) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        return json.load(f)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run a robot subsystem's MQTT agent.")
-    parser.add_argument("--robot-id", required=True, help="e.g. robot_01, qc_01")
-    parser.add_argument("--subsystem", required=True, help="e.g. amr, arm, scanner")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Robot subsystem MQTT agent")
+    p.add_argument("--config", help="agent config JSON (see agents/)")
+    p.add_argument("--robot-id", help="override robot_id from config")
+    p.add_argument("--subsystem", help="override subsystem from config")
+    p.add_argument("--check", action="store_true", help="print driver state and exit (no MQTT)")
+    p.add_argument("--test", nargs=2, metavar=("ACTION", "ZONE"),
+                   help="run ONE action on the hardware and exit (no MQTT). The robot WILL move.")
+    args = p.parse_args()
 
-    agent = RobotAgent(args.robot_id, args.subsystem)
+    if args.config:
+        cfg = load_agent_config(args.config)
+    else:
+        cfg = {"driver": {"type": "sim"}}
+        logger.warning("No --config given: using the SIMULATED driver")
+    robot_id = args.robot_id or cfg.get("robot_id")
+    subsystem = args.subsystem or cfg.get("subsystem")
+    if not robot_id or not subsystem:
+        p.error("robot_id and subsystem are required (in config or on the command line)")
+
+    driver = create_driver(cfg["driver"])
+
+    if args.check:
+        print(json.dumps(driver.get_state(), indent=2))
+        return
+    if args.test:
+        action, zone = args.test
+        print(f"About to run {action} at {zone} on {robot_id}/{subsystem}. Ctrl+C cancels.")
+        cancel = threading.Event()
+        try:
+            result = driver.execute({"subtask_id": "manual-test", "action": action, "zone": zone,
+                                     "target": "TEST"}, cancel)
+        except KeyboardInterrupt:
+            cancel.set()
+            driver.cancel()
+            result = {"state": "cancelled"}
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    agent = RobotAgent(robot_id, subsystem, driver,
+                       heartbeat_s=float(cfg.get("heartbeat_s", 5)),
+                       interlock_with=tuple(cfg.get("interlock_with", [])),
+                       clock_skew_tolerance_s=float(cfg.get("clock_skew_tolerance_s", 5)))
     agent.run_forever()
 
 

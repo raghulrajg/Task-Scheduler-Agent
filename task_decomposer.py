@@ -34,7 +34,11 @@ Each subtask:
     "branch": None,             # "success" | "fail" | None
     "group": "carrier",         # "carrier" | "inspector"
     "releases_robot": False,
+    "attempt": 1,               # bumped by the scheduler on each retry
 }
+
+Validation (known locations, QC zone reachable, types) happens BEFORE this
+in validation.validate_instruction -- this module assumes clean input.
 """
 
 import uuid
@@ -52,7 +56,7 @@ def decompose_pick_qc_route(instruction: Dict[str, Any]) -> List[Dict[str, Any]]
     up after the final place. quality_check is "inspector" -- a separate,
     scarcer QC station that's free again the moment it reports a result.
     """
-    task_id = uuid.uuid4().hex[:8]
+    task_id = uuid.uuid4().hex[:12]
     product = instruction["product"]
     source = instruction["source"]
     qc_zone = instruction["quality_check"]
@@ -76,6 +80,7 @@ def decompose_pick_qc_route(instruction: Dict[str, Any]) -> List[Dict[str, Any]]
             "branch": branch,
             "group": group,
             "releases_robot": releases_robot,
+            "attempt": 1,
         })
 
     add("navigate", product, source, ["navigate"])
