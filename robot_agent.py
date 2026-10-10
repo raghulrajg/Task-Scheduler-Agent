@@ -29,8 +29,8 @@ What this process guarantees:
 Run:
     python3 robot_agent.py --config agents/robot_01_amr.json
     python3 robot_agent.py --config agents/robot_01_amr.json --check            # print driver state
-    python3 robot_agent.py --config agents/robot_01_amr.json --test navigate manufacturing_1
-    python3 robot_agent.py --robot-id robot_01 --subsystem amr                    # simulator
+    python3 robot_agent.py --config agents/robot_01_amr.json --run navigate manufacturing_1
+    python3 robot_agent.py --test --robot-id qc_01 --subsystem scanner            # simulated, test mode
 """
 
 import argparse
@@ -43,11 +43,15 @@ import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
 
+if __name__ == "__main__":      # --test / --real on the command line (must run before config import)
+    import modes
+    modes.apply_cli_mode()
+
 import config
 from drivers import create_driver
 from drivers.base import Driver, failed
-from mqtt_common import (STATE_TOPIC, STATUS_TOPIC, TASK_TOPIC, connected_ok, guarded, make_client,
-                         parse_json, start, stop)
+from mqtt_common import (connected_ok, guarded, make_client, parse_json, parse_robot_topic, start,
+                         state_topic, status_topic, stop, task_topic)
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -73,10 +77,10 @@ class RobotAgent:
         if unknown:
             raise ValueError(f"require_travel_pose {sorted(unknown)} must also be listed in interlock_with")
         self.skew = clock_skew_tolerance_s
-        self.task_topic = TASK_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
-        self.status_topic = STATUS_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
-        self.state_topic = STATE_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
-        self._sibling_filter = STATE_TOPIC.format(robot_id=robot_id, subsystem="+")
+        self.task_topic = task_topic(robot_id, subsystem)
+        self.status_topic = status_topic(robot_id, subsystem)
+        self.state_topic = state_topic(robot_id, subsystem)
+        self._sibling_filter = state_topic(robot_id, "+")
 
         self._lock = threading.RLock()
         self._current: Optional[Dict[str, Any]] = None       # {"key","thread","cancel","subtask"}
@@ -116,11 +120,11 @@ class RobotAgent:
             else:
                 self._handle_task(payload)
             return
-        parts = msg.topic.split("/")
-        if len(parts) == 4 and parts[3] == "state" and parts[2] != self.subsystem:
+        parsed = parse_robot_topic(msg.topic)
+        if parsed and parsed[0] == self.robot_id and parsed[2] == "state" and parsed[1] != self.subsystem:
             payload = parse_json(msg)
             if isinstance(payload, dict):
-                self._siblings[parts[2]] = payload
+                self._siblings[parsed[1]] = payload
 
     def _publish_status(self, payload: Dict[str, Any], retain: bool = False):
         self._client.publish(self.status_topic, json.dumps(payload), qos=1, retain=retain)
@@ -298,8 +302,10 @@ def main():
     p.add_argument("--robot-id", help="override robot_id from config")
     p.add_argument("--subsystem", help="override subsystem from config")
     p.add_argument("--check", action="store_true", help="print driver state and exit (no MQTT)")
-    p.add_argument("--test", nargs=2, metavar=("ACTION", "ZONE"),
+    p.add_argument("--run", nargs=2, metavar=("ACTION", "ZONE"),
                    help="run ONE action on the hardware and exit (no MQTT). The robot WILL move.")
+    p.add_argument("--allow-sim", action="store_true",
+                   help="allow a simulated driver in REAL mode (e.g. a stand-in QC station)")
     args = p.parse_args()
 
     if args.config:
@@ -312,7 +318,14 @@ def main():
     if not robot_id or not subsystem:
         p.error("robot_id and subsystem are required (in config or on the command line)")
 
+    stand_in = args.allow_sim or bool(cfg.get("allow_sim_in_real_mode"))
+    if cfg["driver"].get("type") == "sim" and not config.TEST_MODE and not stand_in and not args.check:
+        p.error("simulated driver in REAL mode: add --test (simulation on the test topics), or set "
+                "\"allow_sim_in_real_mode\": true in the config for a deliberate stand-in")
+    if cfg["driver"].get("type") == "sim" and not config.TEST_MODE and stand_in:
+        logger.warning("STAND-IN: %s/%s is SIMULATED but serving REAL jobs", robot_id, subsystem)
     driver = create_driver(cfg["driver"])
+    logger.info(config.describe_mode())
 
     if args.check:
         report = driver.get_state()
@@ -320,8 +333,8 @@ def main():
             report["result_channel"] = driver.check_result_channel()
         print(json.dumps(report, indent=2))
         return
-    if args.test:
-        action, zone = args.test
+    if args.run:
+        action, zone = args.run
         print(f"About to run {action} at {zone} on {robot_id}/{subsystem}. Ctrl+C cancels.")
         cancel = threading.Event()
         try:

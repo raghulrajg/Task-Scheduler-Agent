@@ -1,0 +1,23 @@
+# Robot PC: every agents/<robot id>_*.json of one robot (REAL mode).
+# Install:  sudo cp deploy/systemd/robot-fleet-robot@.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now robot-fleet-robot@robot_01
+# Logs:     journalctl -u robot-fleet-robot@robot_01 -f
+[Unit]
+Description=Robot fleet - agents of %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fleet
+WorkingDirectory=/opt/robot-fleet
+EnvironmentFile=/opt/robot-fleet/.env
+ExecStart=/opt/robot-fleet/venv/bin/python launch.py robot %i
+Restart=always
+RestartSec=3
+# SIGTERM -> each agent cancels its running action on the hardware, then exits
+KillSignal=SIGTERM
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target

@@ -17,6 +17,10 @@ import threading
 import time
 import uuid
 
+if __name__ == "__main__":      # --test / --real on the command line (must run before config import)
+    import modes
+    modes.apply_cli_mode()
+
 import config
 from mqtt_common import make_client, parse_json, start, stop
 
@@ -43,7 +47,7 @@ def main():
     client = make_client(f"manual_runner_{request_id}", clean_session=True)
 
     def on_connect(c, u, flags, rc, props):
-        c.subscribe(config.EVENT_TOPIC, qos=1)
+        c.subscribe(config.topic(config.EVENT_TOPIC), qos=1)
         connected.set()
 
     def on_message(c, u, msg):
@@ -61,7 +65,7 @@ def main():
     if not connected.wait(10):
         sys.exit("Could not connect to the MQTT broker")
     print("Submitting:", instruction)
-    client.publish(config.INSTRUCTION_TOPIC, json.dumps(instruction), qos=1)
+    client.publish(config.topic(config.INSTRUCTION_TOPIC), json.dumps(instruction), qos=1)
     try:
         while not finished.wait(1):
             pass

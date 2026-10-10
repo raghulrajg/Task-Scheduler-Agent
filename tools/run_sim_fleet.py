@@ -5,18 +5,23 @@ Start a simulated agent for every subsystem in robots_metadata.json, in one
 process, so the whole pipeline (scheduler_service.py + reasoning agent +
 HMI) can be exercised with no hardware.
 
-    python3 tools/run_sim_fleet.py                       # 2 s navigate, 1 s pick/place/QC
-    python3 tools/run_sim_fleet.py --speed 5 --qc-pass-rate 0.5 --fail-rate 0.05
+    python3 tools/run_sim_fleet.py --test                       # 2 s navigate, 1 s pick/place/QC
+    python3 tools/run_sim_fleet.py --test --speed 5 --qc-pass-rate 0.5 --fail-rate 0.05
+
+Refuses to run in real mode: simulated robots must never share topics with real ones.
 """
 
 import argparse
 import json
 import os
+import signal
 import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import modes  # noqa: E402
+modes.apply_cli_mode()
 import config  # noqa: E402
 from drivers.sim import SimDriver  # noqa: E402
 from robot_agent import RobotAgent  # noqa: E402
@@ -28,7 +33,13 @@ def main():
     p.add_argument("--speed", type=float, default=1.0, help="time scale divisor")
     p.add_argument("--qc-pass-rate", type=float, default=0.8)
     p.add_argument("--fail-rate", type=float, default=0.0)
+    p.add_argument("--skip", action="append", default=[], metavar="ROBOT/SUBSYSTEM",
+                   help="don't simulate this one, e.g. robot_01/arm when the real Dobot joins the test")
     args = p.parse_args()
+    if not config.TEST_MODE:
+        sys.exit("Simulated robots only run in TEST mode, so they can never answer on the real robots' "
+                 "topics.\nUse:  python3 tools/run_sim_fleet.py --test   (or: python3 launch.py test)")
+    print(config.describe_mode())
 
     with open(args.metadata) as f:
         robots = json.load(f)["robots"]
@@ -37,6 +48,9 @@ def main():
     for r in robots:
         topics = [s["topic"] for s in r["subsystems"].values()]
         for sub in r["subsystems"].values():
+            if f"{r['id']}/{sub['topic']}" in args.skip:
+                print(f"skipping {r['id']}/{sub['topic']} (real hardware joins the test)")
+                continue
             actions = [c for c in sub["capabilities"] if c in ("navigate", "pick", "place", "quality_check")]
             driver = SimDriver({
                 "actions": actions,
@@ -53,6 +67,7 @@ def main():
             print(f"sim agent {r['id']}/{sub['topic']} actions={actions}")
 
     stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     try:
         while not stop.wait(3):
             for a in agents:
@@ -60,8 +75,11 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        for a in agents:
-            a.shutdown()
+        threads = [threading.Thread(target=a.shutdown) for a in agents]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
 
 
 if __name__ == "__main__":

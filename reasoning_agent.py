@@ -35,6 +35,10 @@ import urllib.request
 import uuid
 from typing import Any, Dict, Optional
 
+if __name__ == "__main__":      # --test / --real on the command line (must run before config import)
+    import modes
+    modes.apply_cli_mode()
+
 import config
 from mqtt_common import connected_ok, guarded, make_client, start, stop
 from validation import InstructionError, SiteConfig, validate_instruction
@@ -103,16 +107,16 @@ class ReasoningAgent:
         if not connected_ok(reason_code):
             logger.error("MQTT connect refused: %s", reason_code)
             return
-        subs = [(config.HMI_PROMPT_TOPIC, 1)]
+        subs = [(config.topic(config.HMI_PROMPT_TOPIC), 1)]
         if config.REQUIRE_CONFIRMATION:
-            subs.append((config.HMI_CONFIRM_TOPIC, 1))
+            subs.append((config.topic(config.HMI_CONFIRM_TOPIC), 1))
         client.subscribe(subs)
-        logger.info("Listening for prompts on '%s'%s", config.HMI_PROMPT_TOPIC,
+        logger.info("Listening for prompts on '%s'%s", config.topic(config.HMI_PROMPT_TOPIC),
                     " (confirmation required)" if config.REQUIRE_CONFIRMATION else "")
 
     def _on_message(self, client, userdata, msg):
         text = msg.payload.decode("utf-8", "replace").strip()
-        if msg.topic == config.HMI_CONFIRM_TOPIC:
+        if msg.topic == config.topic(config.HMI_CONFIRM_TOPIC):
             self._handle_confirm(text)
             return
         request_id = uuid.uuid4().hex[:8]
@@ -132,7 +136,7 @@ class ReasoningAgent:
 
     def _feedback(self, request_id: str, **fields):
         payload = {"request_id": request_id, "ts": time.time(), **fields}
-        self._client.publish(config.HMI_FEEDBACK_TOPIC, json.dumps(payload), qos=1)
+        self._client.publish(config.topic(config.HMI_FEEDBACK_TOPIC), json.dumps(payload), qos=1)
 
     # ---- processing -----------------------------------------------------------------
     def process_prompt(self, prompt: str, request_id: str) -> Optional[Dict[str, Any]]:
@@ -172,14 +176,14 @@ class ReasoningAgent:
                 with self._lock:
                     self._awaiting[job["request_id"]] = {"instruction": instruction, "ts": time.time()}
                 self._feedback(job["request_id"], ok=True, needs_confirmation=True, instruction=instruction,
-                               how_to_confirm={"topic": config.HMI_CONFIRM_TOPIC,
+                               how_to_confirm={"topic": config.topic(config.HMI_CONFIRM_TOPIC),
                                                "payload": {"request_id": job["request_id"], "confirm": True}})
             else:
                 self._forward(instruction)
 
     def _forward(self, instruction: Dict[str, Any]):
-        self._client.publish(config.INSTRUCTION_TOPIC, json.dumps(instruction), qos=1)
-        logger.info("[%s] -> %s %s", instruction["request_id"], config.INSTRUCTION_TOPIC, instruction)
+        self._client.publish(config.topic(config.INSTRUCTION_TOPIC), json.dumps(instruction), qos=1)
+        logger.info("[%s] -> %s %s", instruction["request_id"], config.topic(config.INSTRUCTION_TOPIC), instruction)
         self._feedback(instruction["request_id"], ok=True, forwarded=True, instruction=instruction)
 
     def _handle_confirm(self, text: str):

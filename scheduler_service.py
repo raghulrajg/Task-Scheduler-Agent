@@ -24,6 +24,10 @@ import signal
 import threading
 import time
 
+if __name__ == "__main__":      # --test / --real on the command line (must run before config import)
+    import modes
+    modes.apply_cli_mode()
+
 import config
 from mqtt_client import SchedulerMQTTClient
 from robot_registry import RobotRegistry
@@ -57,6 +61,7 @@ def acquire_single_instance_lock(state_path: str):
 
 
 def main():
+    logger.info(config.describe_mode())
     lock = acquire_single_instance_lock(config.SCHEDULER_STATE_PATH)  # noqa: F841 (held for process life)
     site = SiteConfig.load(config.SITE_CONFIG_PATH)
     registry = RobotRegistry(config.ROBOT_METADATA_PATH,
@@ -102,7 +107,7 @@ def main():
 
     mqtt_client.connect()
     logger.info("Scheduler running. Instructions on '%s', commands on '%s'.",
-                config.INSTRUCTION_TOPIC, config.COMMAND_TOPIC)
+                config.topic(config.INSTRUCTION_TOPIC), config.topic(config.COMMAND_TOPIC))
 
     last_status = 0.0
     try:
@@ -111,7 +116,9 @@ def main():
                 scheduler.tick()
                 now = time.time()
                 if now - last_status >= STATUS_PERIOD_S and mqtt_client.connected:
-                    mqtt_client.publish_fleet_status(scheduler.snapshot())
+                    snap = scheduler.snapshot()
+                    snap["scheduler"] = "running"
+                    mqtt_client.publish_fleet_status(snap)
                     last_status = now
             except Exception:
                 logger.exception("Watchdog tick failed")
@@ -119,6 +126,13 @@ def main():
         pass
     finally:
         logger.info("Shutting down")
+        try:
+            final = scheduler.snapshot()
+            final["scheduler"] = "stopped"
+            mqtt_client.publish_fleet_status(final)   # retained: tools see it is stopped, not just stale
+            time.sleep(0.3)
+        except Exception:
+            pass
         mqtt_client.disconnect()
 
 

@@ -1,0 +1,22 @@
+# Central server: scheduler + reasoning agent (REAL mode).
+# Install:  sudo cp deploy/systemd/robot-fleet-server.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now robot-fleet-server
+# Logs:     journalctl -u robot-fleet-server -f
+[Unit]
+Description=Robot fleet - scheduler + reasoning agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fleet
+WorkingDirectory=/opt/robot-fleet
+EnvironmentFile=/opt/robot-fleet/.env
+ExecStart=/opt/robot-fleet/venv/bin/python launch.py server
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

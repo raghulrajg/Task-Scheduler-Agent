@@ -1,0 +1,13 @@
+{
+  "_comment": "STAND-IN QC station for commissioning, until the real camera is integrated: NO inspection happens and every part PASSES. Run it with: python3 launch.py agents agents/qc_01_stand_in.json. Replace with agents/qc_01_scanner.json when the vision system is ready.",
+  "robot_id": "qc_01",
+  "subsystem": "scanner",
+  "heartbeat_s": 5,
+  "allow_sim_in_real_mode": true,
+  "driver": {
+    "type": "sim",
+    "actions": ["quality_check"],
+    "durations_s": {"quality_check": 2},
+    "qc_pass_rate": 1.0
+  }
+}

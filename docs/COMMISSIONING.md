@@ -36,16 +36,16 @@ and the phases stay the same.
 
 ## 1. Infrastructure
 
-- [ ] Broker: install mosquitto on a wired, always-on host. Copy
-      `deploy/mosquitto/fleet.conf` and `acl.example`. Create TLS certs and one
-      account per role (`scheduler`, `reasoning`, `hmi`, and one account named
-      after each robot_id, e.g. `robot_01`, `qc_01`).
+- [ ] Broker: your **EMQX** (172.25.200.57:1883). Change the password that was
+      published on GitHub (EMQX Dashboard → Access Control → Authentication →
+      Users). Optional hardening: one user per role and the rules in
+      `deploy/emqx/acl.conf.example`.
 - [ ] **NTP/chrony on every host** (scheduler, agent PCs, broker). Agents
       reject a task that arrives after its `expires_at`, so clocks must agree
       to within `clock_skew_tolerance_s` (default 5 s).
 - [ ] Network: agent PC ↔ mobile robot API (its dashboard port), agent PC ↔
       Dobot controller (TCP 29999), agent PC ↔ QC station, everything ↔
-      broker (8883). See "Network layout" in AMR_API_CAPTURE.md. Put the robots on a
+      broker (EMQX 1883, or 8883 with TLS). See "Network layout" in AMR_API_CAPTURE.md. Put the robots on a
       dedicated VLAN/SSID. Check Wi-Fi roaming along every route.
 - [ ] Install on each host:
       ```bash
@@ -53,19 +53,22 @@ and the phases stay the same.
       sudo -u fleet git clone <repo> /opt/robot-fleet && cd /opt/robot-fleet
       sudo -u fleet python3 -m venv venv && sudo -u fleet venv/bin/pip install -r requirements.txt
       sudo -u fleet cp .env.example .env && sudo -u fleet chmod 600 .env   # then edit
+      sudo -u fleet venv/bin/python launch.py check                        # preflight
       ```
 
 ## 2. Simulated end-to-end (no hardware)
 
-- [ ] `pytest` passes on the scheduler host. This includes the end-to-end tests
-      over a real broker.
-- [ ] `python3 scheduler_service.py` + `python3 tools/run_sim_fleet.py` +
-      `python3 manual_runner.py` completes a job.
-- [ ] `python3 tools/run_sim_fleet.py --fail-rate 0.2 --qc-pass-rate 0.5` for
-      30 minutes with several jobs queued. Check with `tools/fleetctl.py
-      status` that failures end in `error` + operator reset, and that nothing
-      gets stuck `busy`.
-- [ ] Kill and restart `scheduler_service.py` mid-job. It should resume
+- [ ] `python3 offline_demo.py` passes all scenarios (no broker needed).
+- [ ] `pytest` passes on the scheduler host. Point the broker tests at your
+      EMQX with `TEST_MQTT_HOST/PORT/USERNAME/PASSWORD`. They run in their own
+      `pytest/<id>/` topic namespace and clean up after themselves.
+- [ ] `python3 launch.py test --jobs 5` completes 5 jobs on your EMQX, with
+      simulated robots under the `sim/` topics.
+- [ ] `python3 launch.py test --fail-rate 0.2 --qc-pass-rate 0.5` for 30
+      minutes with jobs submitted regularly (`tools/fleetctl.py --test submit`).
+      Check with `tools/fleetctl.py --test status` that failures end in `error`
+      plus an operator reset, and that nothing gets stuck `busy`.
+- [ ] Stop and restart the test stack mid-job. It should resume
       (`Restored scheduler state ...` in the log).
 
 ## 3. Configure the site
@@ -93,11 +96,11 @@ and the phases stay the same.
    ```
 4. With a person at the e-stop, drive to each location once:
    ```bash
-   venv/bin/python robot_agent.py --config agents/robot_01_amr.json --test navigate manufacturing_1
+   venv/bin/python robot_agent.py --config agents/robot_01_amr.json --run navigate manufacturing_1
    ```
-   Also test: press the e-stop during `--test` (expect `failed`, and the goal
+   Also test: press the e-stop during `--run` (expect `failed`, and the goal
    must not resume when the e-stop is released). Press Ctrl+C during
-   `--test` (expect the robot to stop).
+   `--run` (expect the robot to stop).
 
 ## 5. Dobot Nova 2, alone
 
@@ -154,7 +157,7 @@ and the phases stay the same.
    If the result channel is **not** usable on your controller, tell us. The
    project can report through a spare DO or Modbus instead.
 5. With a person at the e-stop:
-   `--test pick manufacturing_1`. Also test a missed pick (no part). It must
+   `--run pick manufacturing_1`. Also test a missed pick (no part). It must
    come back `failed` with "reported failure", not `done`.
 
 > Other vendors: example configs for MiR (`agents/examples/mir_amr.json`) and
@@ -163,7 +166,7 @@ and the phases stay the same.
 ## 6. QC station, alone
 
 - [ ] Fill `agents/qc_01_scanner.json` (HTTP) or use the TCP example.
-- [ ] `--check`, then `--test quality_check quality_station` with a known-good
+- [ ] `--check`, then `--run quality_check quality_station` with a known-good
       part and a known-bad part. Also unplug the camera: the result must be
       `failed`, never a pass.
 
@@ -195,8 +198,9 @@ and the phases stay the same.
 - [ ] Run several jobs in parallel and watch for traffic conflicts at shared
       stations. The mobile robots' own fleet/traffic manager (if any) should
       manage right of way between bases. This scheduler does not do path or traffic planning.
-- [ ] Install the systemd units from `deploy/` and enable them. Check that
-      `systemctl stop robot-agent@robot_01_amr` while it drives stops the
+- [ ] Install the systemd units from `deploy/systemd/` (`robot-fleet-server`,
+      `robot-fleet-robot@robot_01`) and enable them. Check that
+      `systemctl stop robot-fleet-robot@robot_01` while it drives stops the
       robot.
 
 ## Operations cheat-sheet
@@ -207,8 +211,8 @@ tools/fleetctl.py watch                      # live events
 tools/fleetctl.py cancel <task_id>           # stop a job (robots stop their current action)
 tools/fleetctl.py reset <robot_id>           # after a human has recovered a robot in 'error'
 tools/fleetctl.py maintenance <robot_id> on  # take a robot out of rotation
-journalctl -u task-scheduler -f              # scheduler log
-journalctl -u robot-agent@robot_01_amr -f    # agent log
+journalctl -u robot-fleet-server -f          # scheduler + reasoning agent log
+journalctl -u robot-fleet-robot@robot_01 -f  # robot_01 agents log
 ```
 
 A robot in **`error`** may be holding a product. Check it physically before

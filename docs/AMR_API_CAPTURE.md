@@ -94,10 +94,10 @@ and 5. Put the dashboard login in `.env` as `AMR_USERNAME` and
 
 ```bash
 python3 robot_agent.py --config agents/robot_01_amr.json --check
-python3 robot_agent.py --config agents/robot_01_amr.json --test navigate manufacturing_1
+python3 robot_agent.py --config agents/robot_01_amr.json --run navigate manufacturing_1
 ```
 
-Then test pressing Ctrl+C during `--test`. The robot must stop, because that
+Then test pressing Ctrl+C during `--run`. The robot must stop, because that
 proves the cancel request works.
 
 ## Things to look out for
@@ -112,7 +112,7 @@ proves the cancel request works.
   commands go over the WebSocket. A small WebSocket/rosbridge variant of the
   driver will be needed. The capture tells exactly what it needs to send.
 - **Firmware updates** can change an unofficial API. Note the robot's software
-  version, and re-run the `--check` / `--test` steps after any update.
+  version, and re-run the `--check` / `--run` steps after any update.
 - **Token lifetime.** The driver logs in again automatically on 401/403. If the
   token goes into a cookie instead of a header, remove `token_path` and the
   cookie is handled automatically.

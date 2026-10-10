@@ -19,7 +19,7 @@ Settings that matter on a real network (Wi-Fi AMRs drop off all the time):
 import json
 import logging
 import ssl
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 import paho.mqtt.client as mqtt
 
@@ -27,14 +27,39 @@ import config
 
 logger = logging.getLogger("mqtt")
 
-TASK_TOPIC = "robots/{robot_id}/{subsystem}/task"      # scheduler -> agent (task + cancel)
-STATUS_TOPIC = "robots/{robot_id}/{subsystem}/status"  # agent -> scheduler (accepted/done/failed/...)
-STATE_TOPIC = "robots/{robot_id}/{subsystem}/state"    # agent -> all (retained heartbeat, LWT)
+# Robot topics, inside the current run mode's namespace (config.TOPIC_PREFIX):
+#   robots/<id>/<sub>/task    scheduler -> agent  (task + cancel)
+#   robots/<id>/<sub>/status  agent -> scheduler  (accepted/done/failed/...)
+#   robots/<id>/<sub>/state   agent -> all        (retained heartbeat, last will)
+def task_topic(robot_id: str, subsystem: str) -> str:
+    return config.topic(f"robots/{robot_id}/{subsystem}/task")
+
+
+def status_topic(robot_id: str, subsystem: str) -> str:
+    return config.topic(f"robots/{robot_id}/{subsystem}/status")
+
+
+def state_topic(robot_id: str, subsystem: str) -> str:
+    return config.topic(f"robots/{robot_id}/{subsystem}/state")
+
+
+def parse_robot_topic(topic: str) -> Optional[Tuple[str, str, str]]:
+    """'<prefix>robots/<id>/<sub>/<kind>' -> (id, sub, kind); None for anything else,
+    including topics from the other run mode's namespace."""
+    prefix = config.TOPIC_PREFIX
+    if not topic.startswith(prefix):
+        return None
+    parts = topic[len(prefix):].split("/")
+    if len(parts) == 4 and parts[0] == "robots":
+        return parts[1], parts[2], parts[3]
+    return None
 
 
 def make_client(client_id: str, clean_session: bool = False,
                 will_topic: Optional[str] = None, will_payload: Optional[dict] = None) -> mqtt.Client:
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id,
+    # The suffix keeps test-mode clients from kicking real ones off the broker
+    # (a broker allows one connection per client id).
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id + config.CLIENT_ID_SUFFIX,
                          clean_session=clean_session)
     client.suppress_exceptions = True
     if config.MQTT_USERNAME:
@@ -55,8 +80,8 @@ def start(client: mqtt.Client, host: Optional[str] = None, port: Optional[int] =
     """Non-blocking connect that keeps retrying in the background."""
     host = host or config.MQTT_BROKER_HOST
     port = port or config.MQTT_BROKER_PORT
-    logger.info("Connecting to MQTT %s:%s (tls=%s, user=%s)", host, port, config.MQTT_TLS,
-                config.MQTT_USERNAME or "-")
+    logger.info("Connecting to MQTT %s:%s (tls=%s, user=%s) -- %s", host, port, config.MQTT_TLS,
+                config.MQTT_USERNAME or "-", config.describe_mode())
     client.connect_async(host, port, keepalive=config.MQTT_KEEPALIVE_S)
     client.loop_start()
 

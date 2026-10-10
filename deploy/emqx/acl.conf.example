@@ -1,0 +1,33 @@
+%% EMQX file-based authorization (EMQX 5.x syntax) -- OPTIONAL hardening.
+%% Today every component can log in as one EMQX user; that works. When you
+%% create one EMQX user per role (Dashboard -> Access Control -> Authentication),
+%% these rules limit what each one may do. First matching rule wins.
+%% Load: Dashboard -> Access Control -> Authorization -> File -> Settings, paste,
+%% and set authorization.no_match = deny once you have verified everything works.
+
+%% ---- central server -------------------------------------------------------
+{allow, {username, "fleet_scheduler"}, subscribe, ["scheduler/instructions", "scheduler/commands",
+                                                   "robots/+/+/status", "robots/+/+/state"]}.
+{allow, {username, "fleet_scheduler"}, publish,   ["scheduler/events", "scheduler/status",
+                                                   "robots/+/+/task"]}.
+{allow, {username, "fleet_reasoning"}, subscribe, ["hmi/user_prompt", "hmi/confirm"]}.
+{allow, {username, "fleet_reasoning"}, publish,   ["hmi/feedback", "scheduler/instructions"]}.
+
+%% ---- operators / HMI --------------------------------------------------------
+{allow, {username, "fleet_hmi"}, publish,   ["hmi/user_prompt", "hmi/confirm",
+                                             "scheduler/instructions", "scheduler/commands"]}.
+{allow, {username, "fleet_hmi"}, subscribe, ["hmi/feedback", "scheduler/events", "scheduler/status",
+                                             "robots/+/+/state"]}.
+
+%% ---- robot PCs: each robot only touches its own topics --------------------------
+{allow, {username, "robot_01"}, subscribe, ["robots/robot_01/+/task", "robots/robot_01/+/state"]}.
+{allow, {username, "robot_01"}, publish,   ["robots/robot_01/+/status", "robots/robot_01/+/state"]}.
+{allow, {username, "qc_01"},    subscribe, ["robots/qc_01/+/task"]}.
+{allow, {username, "qc_01"},    publish,   ["robots/qc_01/+/status", "robots/qc_01/+/state"]}.
+
+%% ---- TEST mode: everything lives under sim/ --------------------------------------
+{allow, {username, "fleet_test"}, all, ["sim/#"]}.
+
+%% ---- dashboard / admin --------------------------------------------------------------
+{allow, {ipaddr, "127.0.0.1"}, all, ["$SYS/#", "#"]}.
+{deny, all}.

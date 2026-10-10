@@ -22,8 +22,8 @@ import logging
 from typing import Callable, Optional
 
 import config
-from mqtt_common import (STATE_TOPIC, STATUS_TOPIC, TASK_TOPIC, connected_ok, guarded,
-                         make_client, parse_json, start, stop)
+from mqtt_common import (connected_ok, guarded, make_client, parse_json, parse_robot_topic, start,
+                         state_topic, status_topic, stop, task_topic)
 
 logger = logging.getLogger("mqtt_client")
 
@@ -59,12 +59,11 @@ class SchedulerMQTTClient:
             return
         self.connected = True
         logger.info("Connected to MQTT broker (session_present=%s)", flags.session_present)
-        subs = [(STATUS_TOPIC.format(robot_id="+", subsystem="+"), 1),
-                (STATE_TOPIC.format(robot_id="+", subsystem="+"), 1)]
+        subs = [(status_topic("+", "+"), 1), (state_topic("+", "+"), 1)]
         if self._on_instruction:
-            subs.append((config.INSTRUCTION_TOPIC, 1))
+            subs.append((config.topic(config.INSTRUCTION_TOPIC), 1))
         if self._on_command:
-            subs.append((config.COMMAND_TOPIC, 1))
+            subs.append((config.topic(config.COMMAND_TOPIC), 1))
         client.subscribe(subs)
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):
@@ -75,17 +74,17 @@ class SchedulerMQTTClient:
         payload = parse_json(msg)
         if payload is None:
             return
-        if msg.topic == config.INSTRUCTION_TOPIC:
+        if msg.topic == config.topic(config.INSTRUCTION_TOPIC):
             if self._on_instruction:
                 self._on_instruction(payload)
             return
-        if msg.topic == config.COMMAND_TOPIC:
+        if msg.topic == config.topic(config.COMMAND_TOPIC):
             if self._on_command:
                 self._on_command(payload)
             return
-        parts = msg.topic.split("/")
-        if len(parts) == 4 and parts[0] == "robots":
-            robot_id, subsystem, kind = parts[1], parts[2], parts[3]
+        parsed = parse_robot_topic(msg.topic)
+        if parsed:
+            robot_id, subsystem, kind = parsed
             if kind == "status" and self._on_status:
                 self._on_status(robot_id, subsystem, payload)
             elif kind == "state" and self._on_state:
@@ -93,20 +92,20 @@ class SchedulerMQTTClient:
 
     # ---- publishing --------------------------------------------------------------
     def publish_task(self, robot_id: str, subsystem: str, subtask: dict):
-        topic = TASK_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
+        topic = task_topic(robot_id, subsystem)
         logger.info("-> %s %s#%s %s %s", topic, subtask["subtask_id"], subtask.get("attempt"),
                     subtask["action"], subtask.get("zone"))
         self._client.publish(topic, json.dumps(subtask), qos=1)
 
     def publish_cancel(self, robot_id: str, subsystem: str, subtask_id: str, attempt: int, reason: str):
-        topic = TASK_TOPIC.format(robot_id=robot_id, subsystem=subsystem)
+        topic = task_topic(robot_id, subsystem)
         payload = {"type": "cancel", "subtask_id": subtask_id, "attempt": attempt, "reason": reason}
         logger.warning("-> %s CANCEL %s#%s (%s)", topic, subtask_id, attempt, reason)
         self._client.publish(topic, json.dumps(payload), qos=1)
 
     def publish_event(self, event: dict):
-        self._client.publish(config.EVENT_TOPIC, json.dumps(event, default=str), qos=1)
+        self._client.publish(config.topic(config.EVENT_TOPIC), json.dumps(event, default=str), qos=1)
 
     def publish_fleet_status(self, snapshot: dict):
-        self._client.publish(config.FLEET_STATUS_TOPIC, json.dumps(snapshot, default=str),
+        self._client.publish(config.topic(config.FLEET_STATUS_TOPIC), json.dumps(snapshot, default=str),
                              qos=0, retain=True)

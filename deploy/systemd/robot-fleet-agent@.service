@@ -1,0 +1,20 @@
+# One agent config, e.g. the QC station or its stand-in (REAL mode).
+#   agents/qc_01_stand_in.json -> sudo systemctl enable --now robot-fleet-agent@qc_01_stand_in
+[Unit]
+Description=Robot fleet - agent %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fleet
+WorkingDirectory=/opt/robot-fleet
+EnvironmentFile=/opt/robot-fleet/.env
+ExecStart=/opt/robot-fleet/venv/bin/python launch.py agents agents/%i.json
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target
