@@ -156,8 +156,10 @@ def main():
             print(f"!! last status is {age:.0f}s old -- is the scheduler running in this mode?")
         print("ROBOTS")
         for r in snap.get("robots", []):
+            where = "".join(f"  [{t} at {h.get('at_location') or '-'}]"
+                            for t, h in (r.get("subsystems") or {}).items() if "at_location" in h)
             print(f"  {r['id']:10} {r['status']:12} {'healthy' if r['healthy'] else r['health_problem']}"
-                  f"{'  (' + r['reason'] + ')' if r.get('reason') else ''}")
+                  f"{where}{'  (' + r['reason'] + ')' if r.get('reason') else ''}")
         print(f"TASKS (pending subtasks: {snap.get('pending')})")
         for t in snap.get("tasks", []):
             cur = ", ".join(f"{c['action']}@{c['zone']} on {c['robot']}" for c in t.get("current", []))

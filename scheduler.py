@@ -94,7 +94,8 @@ class TaskScheduler:
         the instruction is invalid (nothing is dispatched in that case)."""
         clean = validate_instruction(
             instruction, self.site,
-            inspection_zones=self.registry.zones_with_capability("quality_check"))
+            inspection_zones=self.registry.zones_with_capability("quality_check"),
+            reachable_locations=self.registry.reachable_locations())
         subtasks = decompose(clean)
         task_id = subtasks[0]["task_id"]
         now = self._clock()
@@ -282,8 +283,14 @@ class TaskScheduler:
                 self._fail_task(task, f"carrier robot {task['carrier_robot']} no longer in registry")
                 return False
         else:
+            # A carrier is claimed for the whole job, so its base must have
+            # coordinates for every place the job can take it.
+            places = None
+            if sub["group"] == "carrier":
+                ins = task["instruction"]
+                places = [ins[k] for k in ("source", "quality_check", "success_dest", "fail_dest")]
             try:
-                robot = self.allocator.allocate(sub)
+                robot = self.allocator.allocate(sub, locations=places)
             except AllocationError as e:
                 if (task_id, sid) not in self._pending:
                     self._pending.append((task_id, sid))

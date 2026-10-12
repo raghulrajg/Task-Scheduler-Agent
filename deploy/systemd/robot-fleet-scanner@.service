@@ -1,0 +1,23 @@
+# Scanner PC: MQTT bridge for one QC station (REAL mode), e.g. qc_01.
+# Set SCANNER_COMMAND in /opt/robot-fleet/.env (the program that does one inspection).
+# Install:  sudo cp deploy/systemd/robot-fleet-scanner@.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now robot-fleet-scanner@qc_01
+# Logs:     journalctl -u robot-fleet-scanner@qc_01 -f
+[Unit]
+Description=Robot fleet - scanner bridge %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fleet
+WorkingDirectory=/opt/robot-fleet
+EnvironmentFile=/opt/robot-fleet/.env
+ExecStart=/opt/robot-fleet/venv/bin/python launch.py scanner %i
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

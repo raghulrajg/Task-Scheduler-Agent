@@ -1,49 +1,25 @@
 {
-  "_comment": "Mobile base of robot_01, driven through its own web dashboard API. EVERYTHING under navigate/cancel/status/fields/login is a PLACEHOLDER until the capture is done (docs/AMR_API_CAPTURE.md). Run: python3 tools/har_summary.py capture.har, then fill this in.",
+  "_comment": "ONIX mobile base of robot_01. Targets (x, y, theta) come from stations.json at the start of every move; the move is reported done only after the robot is verified within tolerance, stopped and localized. Manage locations with tools/amr_stations.py.",
   "robot_id": "robot_01",
   "subsystem": "amr",
   "heartbeat_s": 5,
   "interlock_with": ["arm"],
   "require_travel_pose": ["arm"],
   "driver": {
-    "type": "http_amr",
-    "base_url": "http://ROBOT-IP",
-    "headers": {"Content-Type": "application/json"},
-    "login": {
-      "method": "POST",
-      "path": "/REPLACE/login",
-      "json": {"username": "${AMR_USERNAME}", "password": "${AMR_PASSWORD}"},
-      "token_path": "REPLACE.token",
-      "token_header": "Authorization",
-      "token_prefix": "Bearer "
-    },
-    "locations": {
-      "manufacturing_1": {"id": "REPLACE-drop-point-name-or-id"},
-      "quality_station": {"id": "REPLACE"},
-      "package_area":    {"id": "REPLACE"},
-      "waste_area":      {"id": "REPLACE"},
-      "rest_position":   {"id": "REPLACE"}
-    },
-    "navigate": {"method": "POST", "path": "/REPLACE/goto", "json": {"REPLACE_point_key": "{id}"}},
-    "cancel":   {"method": "POST", "path": "/REPLACE/cancel"},
-    "status":   {"method": "GET",  "path": "/REPLACE/status"},
-    "fields": {
-      "nav_state": "REPLACE.path.to.navigation.state",
-      "running_values": ["REPLACE"],
-      "arrived_values": ["REPLACE"],
-      "failed_values":  ["REPLACE"],
-      "target": null,
-      "battery": null,
-      "battery_scale": 1,
-      "estop": null,
-      "estop_values": [true],
-      "error": null
-    },
-    "poll_interval_s": 0.5,
-    "settle_s": 3,
+    "type": "onix",
+    "host": "172.22.74.119",
+    "stations_file": "stations.json",
+    "nav_mode": "point",
+    "xy_tolerance_m": 0.10,
+    "yaw_tolerance_deg": 5,
+    "settle_s": 1.5,
+    "stationary_linear": 0.02,
+    "stationary_angular": 0.02,
     "start_timeout_s": 15,
+    "stall_timeout_s": 30,
     "mission_timeout_s": 280,
-    "max_comm_loss_s": 30,
-    "request_timeout_s": 5
+    "max_comm_loss_s": 15,
+    "min_localization": 70,
+    "ports": {"rest": 3000, "control": 4000, "status": 7000}
   }
 }

@@ -1,19 +1,28 @@
 {
-  "_comment": "Dobot Nova 2 mounted on robot_01's mobile base. travel_joints is required: the base will not drive until the arm reports it is in this pose. One DobotStudio Pro project per (action, location); each project ends in the travel pose and writes SetOutputInt(0, 1) on success / SetOutputInt(0, 2) on failure. Check the controller IP and firmware generation (v3/v4) in DobotStudio Pro before first use.",
+  "_comment": "Dobot Nova 2 mounted on robot_01's ONIX base. require_base_at_zone: the arm only runs a pick/place when the base reports (in its heartbeat) that it is at the task's location -- i.e. its last move there was verified and it has not moved since. travel_joints is required: the base will not drive until the arm reports it is in this pose. One DobotStudio Pro project per (action, location); each project ends in the travel pose and writes SetOutputInt(0, 1) on success / SetOutputInt(0, 2) on failure. Check the controller IP and firmware generation (v3/v4) in DobotStudio Pro before first use.",
   "robot_id": "robot_01",
   "subsystem": "arm",
   "heartbeat_s": 5,
   "interlock_with": ["amr"],
+  "require_base_at_zone": "amr",
   "driver": {
     "type": "dobot",
     "host": "192.168.5.1",
     "port": 29999,
     "protocol": "v4",
     "projects": {
-      "pick":  {"manufacturing_1": "pick_manufacturing_1"},
-      "place": {"package_area": "place_package_area", "waste_area": "place_waste_area"}
+      "pick": {
+        "manufacturing_1": "pick_manufacturing_1"
+      },
+      "place": {
+        "package_area": "place_package_area",
+        "waste_area": "place_waste_area"
+      }
     },
-    "result": {"kind": "output_int", "address": 0},
+    "result": {
+      "kind": "output_int",
+      "address": 0
+    },
     "request_control": true,
     "auto_enable": false,
     "enable_args": "",

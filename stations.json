@@ -1,0 +1,59 @@
+{
+  "_comment": "AMR station/location metadata. x, y in metres, theta in radians, AMR map frame. Maintain with: python3 tools/amr_stations.py --help",
+  "map": {
+    "name": "Map 17:3 September 10",
+    "source": "amr_tools/maps/live_map.json",
+    "pulled_at": "2026-10-11T06:57:59",
+    "frame": "AMR map frame: x, y in metres; theta in radians, counter-clockwise, 0 = +x axis"
+  },
+  "defaults": {
+    "xy_tolerance_m": 0.1,
+    "yaw_tolerance_deg": 5.0
+  },
+  "stations": {
+    "LM1": {
+      "class": "LocationMark",
+      "x": -1.1577,
+      "y": 0.0483,
+      "theta": 0.0
+    },
+    "LM2": {
+      "class": "LocationMark",
+      "x": -3.8201,
+      "y": 0.0108,
+      "theta": 0.0
+    }
+  },
+  "locations": {
+    "manufacturing_1": {
+      "station": "LM1",
+      "x": -1.1577,
+      "y": 0.0483,
+      "theta": 0.0
+    },
+    "quality_station": {
+      "station": "LM2",
+      "x": -3.8201,
+      "y": 0.0108,
+      "theta": 0.0
+    },
+    "package_area": {
+      "station": null,
+      "x": null,
+      "y": null,
+      "theta": null
+    },
+    "waste_area": {
+      "station": null,
+      "x": null,
+      "y": null,
+      "theta": null
+    },
+    "rest_position": {
+      "station": null,
+      "x": null,
+      "y": null,
+      "theta": null
+    }
+  }
+}

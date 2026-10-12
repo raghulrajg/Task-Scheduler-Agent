@@ -9,6 +9,11 @@ HMI) can be exercised with no hardware.
     python3 tools/run_sim_fleet.py --test --speed 5 --qc-pass-rate 0.5 --fail-rate 0.05
 
 Refuses to run in real mode: simulated robots must never share topics with real ones.
+
+Like the real fleet, each simulated base reports where it is (at_location)
+and which locations it has coordinates for (every site.json location, or
+--locations), and each simulated arm refuses to pick/place unless its base
+reports it is at the task's location ("require_base_at_zone").
 """
 
 import argparse
@@ -35,6 +40,9 @@ def main():
     p.add_argument("--fail-rate", type=float, default=0.0)
     p.add_argument("--skip", action="append", default=[], metavar="ROBOT/SUBSYSTEM",
                    help="don't simulate this one, e.g. robot_01/arm when the real Dobot joins the test")
+    p.add_argument("--site", default=config.SITE_CONFIG_PATH)
+    p.add_argument("--locations", help="comma-separated locations the simulated bases have coordinates "
+                                       "for (default: all site.json locations)")
     args = p.parse_args()
     if not config.TEST_MODE:
         sys.exit("Simulated robots only run in TEST mode, so they can never answer on the real robots' "
@@ -43,6 +51,11 @@ def main():
 
     with open(args.metadata) as f:
         robots = json.load(f)["robots"]
+    if args.locations:
+        locations = [x.strip() for x in args.locations.split(",") if x.strip()]
+    else:
+        with open(args.site) as f:
+            locations = sorted(json.load(f)["locations"])
 
     agents = []
     for r in robots:
@@ -58,9 +71,14 @@ def main():
                                 "place": 1 / args.speed, "quality_check": 1 / args.speed},
                 "fail_rate": {a: args.fail_rate for a in actions},
                 "qc_pass_rate": args.qc_pass_rate,
+                "report_location": True, "locations": locations,
             })
             siblings = tuple(t for t in topics if t != sub["topic"])
+            base = next((s["topic"] for s in r["subsystems"].values()
+                         if "navigate" in s["capabilities"] and s["topic"] != sub["topic"]), None)
+            arm = any(c in ("pick", "place") for c in actions)
             agent = RobotAgent(r["id"], sub["topic"], driver, heartbeat_s=3, interlock_with=siblings,
+                               require_base_at_zone=base if arm else None,
                                client_id=f"sim_{r['id']}_{sub['topic']}")
             agent.start()
             agents.append(agent)

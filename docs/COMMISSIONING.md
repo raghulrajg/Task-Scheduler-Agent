@@ -43,10 +43,12 @@ and the phases stay the same.
 - [ ] **NTP/chrony on every host** (scheduler, agent PCs, broker). Agents
       reject a task that arrives after its `expires_at`, so clocks must agree
       to within `clock_skew_tolerance_s` (default 5 s).
-- [ ] Network: agent PC ↔ mobile robot API (its dashboard port), agent PC ↔
-      Dobot controller (TCP 29999), agent PC ↔ QC station, everything ↔
-      broker (EMQX 1883, or 8883 with TLS). See "Network layout" in AMR_API_CAPTURE.md. Put the robots on a
-      dedicated VLAN/SSID. Check Wi-Fi roaming along every route.
+- [ ] Network: robot PC ↔ ONIX robot (`172.22.74.119`, TCP 3000, 4000, 7000),
+      robot PC ↔ Dobot controller (TCP 29999), scanner PC ↔ broker, everything
+      ↔ broker (EMQX 1883, or 8883 with TLS). The ONIX API is only on the
+      robot's own network, so the robot PC needs an interface on it **and**
+      one on the factory network (or use a two-interface gateway PC). Put the
+      robots on a dedicated VLAN/SSID. Check Wi-Fi roaming along every route.
 - [ ] Install on each host:
       ```bash
       sudo useradd -r -m -d /opt/robot-fleet fleet
@@ -81,26 +83,43 @@ and the phases stay the same.
 - [ ] `robots_metadata.json`: the real fleet, with QC stations' `zones` set to
       their location.
 
-## 4. Mobile robot (web-dashboard API), alone
+## 4. ONIX mobile robot, alone
 
-1. Capture the dashboard's API and fill in `agents/robot_01_amr.json` by
-   following **[AMR_API_CAPTURE.md](AMR_API_CAPTURE.md)**.
-2. In the dashboard, make a drop point for every location in `site.json`.
-   Where the arm works, make the stop repeatable. Use the robot's precise
-   docking/marker or reflector feature if it has one, or a mechanical
-   locating fixture. A normal navigation stop is usually only accurate to a
-   few centimetres.
-3. Check:
+1. Set the robot IP in `agents/robot_01_amr.json` (`"host"`). Check the
+   robot PC reaches it: `python3 tools/amr_stations.py where` prints the pose
+   and localization.
+2. **Coordinates for every location** (`stations.json`, README 3.4):
    ```bash
-   venv/bin/python robot_agent.py --config agents/robot_01_amr.json --check   # ready, battery, nav_state
+   venv/bin/python tools/amr_stations.py pull            # stations from the live map
+   venv/bin/python tools/amr_stations.py list
+   venv/bin/python tools/amr_stations.py assign manufacturing_1 LM1   # if LM1 really is that place
+   # drive the robot to each remaining place in the ONIX web app, then:
+   venv/bin/python tools/amr_stations.py teach package_area
+   venv/bin/python tools/amr_stations.py check           # must exit 0
    ```
-4. With a person at the e-stop, drive to each location once:
+   The shipped file links `manufacturing_1` → LM1 and `quality_station` → LM2.
+   **That is an assumption**: confirm it on the map, or re-assign.
+   Where the arm works, make the stop repeatable. Use a mechanical locating
+   fixture or marker if you can, and let each Dobot project re-localise.
+3. Arrival tolerance: start with 0.10 m / 5°. Drive to each place a few times
+   and look at `error_m` / `error_deg` in the result. Tighten per location
+   (`set ... --xy-tol 0.05 --yaw-tol 3`) only as far as the robot reliably
+   reaches. If the robot stops outside the tolerance, the move fails after
+   `stall_timeout_s` with `stopped 0.xx m away`.
+4. Check:
+   ```bash
+   venv/bin/python robot_agent.py --config agents/robot_01_amr.json --check   # pose, localization, at_location
+   ```
+5. With a person at the e-stop, drive to each location once:
    ```bash
    venv/bin/python robot_agent.py --config agents/robot_01_amr.json --run navigate manufacturing_1
    ```
-   Also test: press the e-stop during `--run` (expect `failed`, and the goal
-   must not resume when the e-stop is released). Press Ctrl+C during
-   `--run` (expect the robot to stop).
+   Expect `done` with `"verified": true` and a small `error_m`. Also test:
+   - press the e-stop during `--run`: expect `failed`, and the goal must not
+     resume when the e-stop is released;
+   - press Ctrl+C during `--run`: expect the robot to stop;
+   - block the path: expect `failed` (`stopped ... away`) and a cancel;
+   - a location with no pose: expect `failed` (`assign or teach it`) and no motion.
 
 ## 5. Dobot Nova 2, alone
 
@@ -154,6 +173,10 @@ and the phases stay the same.
    venv/bin/python robot_agent.py --config agents/robot_01_arm.json --check
    ```
    Expect `"ready": true`, `"travel_pose": true` and `"result_channel": "ok"`.
+   The arm agent also has `"require_base_at_zone": "amr"`: under scheduler
+   control it only runs a project when the base reports it is at that
+   project's location. (`--run` drives the driver directly and skips the
+   agent's interlocks, so stand the base at the right place yourself.)
    If the result channel is **not** usable on your controller, tell us. The
    project can report through a spare DO or Modbus instead.
 5. With a person at the e-stop:
@@ -163,12 +186,16 @@ and the phases stay the same.
 > Other vendors: example configs for MiR (`agents/examples/mir_amr.json`) and
 > Universal Robots (`agents/examples/ur_arm.json`) are kept for reference.
 
-## 6. QC station, alone
+## 6. QC station, alone (MQTT only)
 
-- [ ] Fill `agents/qc_01_scanner.json` (HTTP) or use the TCP example.
-- [ ] `--check`, then `--run quality_check quality_station` with a known-good
-      part and a known-bad part. Also unplug the camera: the result must be
-      `failed`, never a pass.
+- [ ] On the scanner PC: a program that does one inspection and prints `PASS`
+      or `FAIL` (or JSON `{"pass": true, ...}`). It gets `QC_PRODUCT`,
+      `QC_STATION` and `QC_REQUEST_ID`. Put it in `.env` as `SCANNER_COMMAND`,
+      then `python3 launch.py scanner qc_01`.
+- [ ] `python3 launch.py check` shows `scanner bridge qc_01: online`.
+- [ ] `venv/bin/python robot_agent.py --config agents/qc_01_scanner.json --run quality_check quality_station`
+      with a known-good part and a known-bad part. Also unplug the camera / stop
+      the bridge: the result must be `failed`, never a pass.
 
 ## 7. One robot, full job, supervised
 
@@ -201,7 +228,7 @@ and the phases stay the same.
 - [ ] Install the systemd units from `deploy/systemd/` (`robot-fleet-server`,
       `robot-fleet-robot@robot_01`) and enable them. Check that
       `systemctl stop robot-fleet-robot@robot_01` while it drives stops the
-      robot.
+      robot. On the scanner PC: `robot-fleet-scanner@qc_01`.
 
 ## Operations cheat-sheet
 

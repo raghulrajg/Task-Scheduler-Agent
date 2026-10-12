@@ -1,17 +1,15 @@
 {
-  "_comment": "QC vision station qc_01. Use type http_inspection for a vision service with an HTTP endpoint, or tcp_inspection for a camera with a trigger/OK-NG socket protocol (see drivers/inspection.py).",
+  "_comment": "QC station qc_01 over MQTT only. This agent publishes inspection requests on qc/qc_01/request and waits for the verdict on qc/qc_01/result. The scanner PC runs tools/scanner_bridge.py (or the camera publishes the same messages itself). Run this agent on the central server: python3 launch.py agents agents/qc_01_scanner.json",
   "robot_id": "qc_01",
   "subsystem": "scanner",
   "heartbeat_s": 5,
-  "interlock_with": [],
   "driver": {
-    "type": "http_inspection",
-    "trigger_url": "http://192.168.12.30:8080/inspect",
-    "method": "POST",
-    "pass_field": "result.pass",
+    "type": "mqtt_inspection",
+    "station": "qc_01",
+    "timeout_s": 30,
+    "health_timeout_s": 20,
+    "pass_field": "pass",
     "pass_values": [true, "OK", "PASS"],
-    "fail_values": [false, "NG", "FAIL"],
-    "health_url": "http://192.168.12.30:8080/health",
-    "timeout_s": 30
+    "fail_values": [false, "NG", "FAIL"]
   }
 }

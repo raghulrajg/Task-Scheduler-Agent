@@ -1,2 +1,3 @@
 paho-mqtt>=2.0,<3
 python-dotenv>=1.0
+websocket-client>=1.6       # ONIX AMR driver (drivers/onix.py, tools/amr_stations.py)

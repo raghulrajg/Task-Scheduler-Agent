@@ -20,6 +20,7 @@ Broker settings (your EMQX) come from .env.
     python3 launch.py server --no-llm            # scheduler only
     python3 launch.py robot robot_01             # robot PC: every agents/robot_01_*.json
     python3 launch.py agents agents/qc_01_scanner.json   # explicit agent configs
+    python3 launch.py scanner qc_01 --command "python3 /opt/vision/check.py"   # scanner PC: MQTT bridge
 
 Talk to a running stack from another terminal (add --test for test mode):
     python3 manual_runner.py [--test]            # submit one job and follow it
@@ -192,6 +193,29 @@ def role_robot(args):
     supervise(agent_children(paths, env_for("real")))
 
 
+def _dotenv_value(key: str) -> Optional[str]:
+    try:
+        from dotenv import dotenv_values
+        return dotenv_values(os.environ.get("ENV_FILE", ".env")).get(key) or None
+    except Exception:
+        return None
+
+
+def role_scanner(args):
+    mode = "test" if args.test else "real"
+    argv = [PY, "tools/scanner_bridge.py", "--station", args.station, "--timeout", str(args.timeout)]
+    if args.simulate is not None:
+        argv += ["--simulate", str(args.simulate)]
+    elif args.command:
+        argv += ["--command", args.command]
+    elif not (os.environ.get("SCANNER_COMMAND") or _dotenv_value("SCANNER_COMMAND")):
+        out("note: no --command / --simulate / SCANNER_COMMAND: the bridge calls inspect() in "
+            "tools/scanner_bridge.py, which you must fill in first (until then every inspection is "
+            "reported as an error = failed QC)")
+    out(f"{mode.upper()} mode: scanner bridge for {args.station} (MQTT only). Ctrl+C to stop.")
+    supervise([Child(f"scanner {args.station}", argv, env_for(mode), COLORS[3])])
+
+
 def role_agents(args):
     for p in args.configs:
         if not os.path.exists(p):
@@ -218,12 +242,14 @@ def role_check(args):
     probe = config.topic(f"fleet/preflight/{uuid.uuid4().hex[:8]}")
     status_topic = config.topic(config.FLEET_STATUS_TOPIC)
     heartbeats = {}
+    scanners = {}
+    scanner_filter = config.topic("qc/+/status")
     c = make_client(f"preflight_{uuid.uuid4().hex[:6]}", clean_session=True)
 
     def on_connect(cl, u, flags, rc, props):
         result["rc"] = str(rc)
         if not rc.is_failure:
-            cl.subscribe([(probe, 1), (status_topic, 0), (state_topic("+", "+"), 1)])
+            cl.subscribe([(probe, 1), (status_topic, 0), (state_topic("+", "+"), 1), (scanner_filter, 1)])
 
     def on_subscribe(cl, u, mid, rcs, props):
         cl.publish(probe, b"ping", qos=1)
@@ -233,6 +259,10 @@ def role_check(args):
             got.set()
         elif msg.topic == status_topic:
             result["status"] = parse_json(msg)
+        elif msg.topic.endswith("/status") and msg.topic.startswith(config.topic("qc/")):
+            payload = parse_json(msg)
+            if isinstance(payload, dict):
+                scanners[msg.topic.split("/")[-2]] = payload
         else:
             parsed = parse_robot_topic(msg.topic)
             payload = parse_json(msg)
@@ -271,9 +301,18 @@ def role_check(args):
                 for name, hb in sorted(heartbeats.items()):
                     state = "online" if hb.get("online") else "OFFLINE"
                     extra = f" ready={hb.get('ready')} battery={hb.get('battery')} {hb.get('detail', '')}"
+                    if "at_location" in hb:
+                        extra += (f" | at {hb.get('at_location') or '-'}; coordinates for "
+                                  f"{len(hb.get('locations') or [])} location(s)")
                     line("OK" if hb.get("online") else "WARN", f"agent {name}: {state}{extra if hb.get('online') else ''}")
             else:
                 line("INFO", "no robot agents have connected in this mode yet")
+            for station, hb in sorted(scanners.items()):
+                age = time.time() - float(hb.get("ts") or 0)
+                good = hb.get("online") and age < 30
+                line("OK" if good else "WARN", f"scanner bridge {station}: "
+                     f"{'online' if hb.get('online') else 'OFFLINE'} ({hb.get('mode', '?')}, {age:.0f}s ago) "
+                     f"{hb.get('detail', '')}")
         c.loop_stop()
         c.disconnect()
     except OSError as e:
@@ -301,6 +340,32 @@ def role_check(args):
     except Exception as e:
         ok = False
         line("FAIL", f"config files: {e}")
+        site = None
+    if site is not None:
+        import stations as stations_mod
+        seen = set()
+        for p in sorted(glob.glob(os.path.join("agents", "*.json"))):
+            try:
+                with open(p) as f:
+                    drv_cfg = json.load(f).get("driver", {})
+            except (OSError, ValueError):
+                continue
+            if drv_cfg.get("type") != "onix" or drv_cfg.get("stations_file", "stations.json") in seen:
+                continue
+            sf = drv_cfg.get("stations_file", "stations.json")
+            seen.add(sf)
+            try:
+                have = set(stations_mod.assigned_locations(stations_mod.load(sf)))
+            except (OSError, ValueError) as e:
+                ok = False
+                line("FAIL", f"{sf} (for {os.path.basename(p)}): {e}")
+                continue
+            missing = sorted(set(site.locations) - have)
+            if missing:
+                line("WARN", f"{sf}: no x/y/theta for {missing} -- jobs using them are refused "
+                             f"(python3 tools/amr_stations.py assign|teach|set ...)")
+            else:
+                line("OK", f"{sf}: every site location has x/y/theta")
 
     for rid in args.robot_ids:
         out(f"\nHardware  {rid}  (state only; nothing moves)")
@@ -355,6 +420,14 @@ def main():
     r = sub.add_parser("robot", help="REAL mode: all agents of these robots (agents/<id>_*.json)")
     r.add_argument("robot_ids", nargs="+")
     r.set_defaults(fn=role_robot)
+
+    sc = sub.add_parser("scanner", help="scanner PC: MQTT bridge between the QC agent and your vision program")
+    sc.add_argument("station", nargs="?", default="qc_01")
+    sc.add_argument("--command", help="program that does one inspection and prints PASS/FAIL or JSON")
+    sc.add_argument("--simulate", type=float, metavar="PASS_RATE", help="random verdicts (testing only)")
+    sc.add_argument("--timeout", type=float, default=25)
+    sc.add_argument("--test", action="store_true", help="answer on the test-mode topics (sim/...)")
+    sc.set_defaults(fn=role_scanner)
 
     a = sub.add_parser("agents", help="REAL mode: these agent config files")
     a.add_argument("configs", nargs="+")

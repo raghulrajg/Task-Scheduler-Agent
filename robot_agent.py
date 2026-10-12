@@ -22,7 +22,11 @@ What this process guarantees:
   * a stale task (delivered after its accept deadline, e.g. queued while
     the robot was off Wi-Fi and already failed over) is refused;
   * a subtask is refused while a sibling subsystem on the same robot is
-    busy (arm won't start while the base is driving, and vice versa).
+    busy (arm won't start while the base is driving, and vice versa);
+    with "require_travel_pose" the base also needs the arm to report its
+    tucked-in pose, and with "require_base_at_zone" the arm only picks or
+    places when the base reports it is at the task's location (its last
+    move there was verified and it has not moved since).
     This is a SOFTWARE interlock only -- the real one belongs in the robot
     controllers / safety PLC.
 
@@ -59,6 +63,8 @@ logger = logging.getLogger("robot_agent")
 
 TERMINAL = ("done", "failed", "cancelled")
 RESULT_CACHE = 500
+# driver state passed through to the heartbeat (siblings and the scheduler read them)
+HEARTBEAT_EXTRAS = ("travel_pose", "at_location", "at_locations", "locations", "pose")
 
 
 class RobotAgent:
@@ -66,6 +72,7 @@ class RobotAgent:
                  heartbeat_s: float = 5.0, interlock_with: Tuple[str, ...] = (),
                  clock_skew_tolerance_s: float = 5.0, client_id: Optional[str] = None,
                  require_travel_pose: Tuple[str, ...] = (),
+                 require_base_at_zone: Optional[str] = None,
                  host: Optional[str] = None, port: Optional[int] = None):
         self.robot_id, self.subsystem, self.driver = robot_id, subsystem, driver
         self.heartbeat_s = heartbeat_s
@@ -76,6 +83,11 @@ class RobotAgent:
         unknown = set(self.require_travel_pose) - set(self.interlock_with)
         if unknown:
             raise ValueError(f"require_travel_pose {sorted(unknown)} must also be listed in interlock_with")
+        # Sibling base that must report at_location == the task's zone before
+        # we act (an arm on a mobile base: never pick/place anywhere else).
+        self.require_base_at_zone = require_base_at_zone
+        if require_base_at_zone and require_base_at_zone not in self.interlock_with:
+            raise ValueError(f"require_base_at_zone {require_base_at_zone!r} must also be listed in interlock_with")
         self.skew = clock_skew_tolerance_s
         self.task_topic = task_topic(robot_id, subsystem)
         self.status_topic = status_topic(robot_id, subsystem)
@@ -147,12 +159,15 @@ class RobotAgent:
         payload = {"online": True, "ready": bool(st.get("ready")), "estop": bool(st.get("estop")),
                    "battery": st.get("battery"), "detail": st.get("detail", ""),
                    "busy": current is not None, "current": current, "ts": time.time()}
-        if "travel_pose" in st:
-            payload["travel_pose"] = st["travel_pose"]
+        for key in HEARTBEAT_EXTRAS:
+            if key in st:
+                payload[key] = st[key]
+        if current is not None and "navigate" in self.driver.actions and "at_location" in payload:
+            payload["at_location"], payload["at_locations"] = None, []   # driving: not "at" anywhere
         self._client.publish(self.state_topic, json.dumps(payload), qos=1, retain=True)
 
     # ---- task handling ---------------------------------------------------------------
-    def _interlock_problem(self) -> Optional[str]:
+    def _interlock_problem(self, task: Dict[str, Any]) -> Optional[str]:
         for sib in self.interlock_with:
             st = self._siblings.get(sib)
             if st is None:
@@ -166,6 +181,17 @@ class RobotAgent:
             if sib in self.require_travel_pose and st.get("travel_pose") is not True:
                 return (f"interlock: sibling '{sib}' does not report a travel pose -- set travel_joints "
                         f"in its agent config")
+            if sib == self.require_base_at_zone:
+                zone = task.get("zone")
+                here = st.get("at_locations")
+                if not isinstance(here, list):
+                    here = [st.get("at_location")] if st.get("at_location") else []
+                if zone not in here:
+                    if "at_location" not in st:
+                        return (f"interlock: base '{sib}' does not report its location "
+                                f"(needs a driver with stations, e.g. onix)")
+                    return (f"interlock: base '{sib}' is not at {zone!r} "
+                            f"(it reports {st.get('at_location') or 'no known location'})")
         return None
 
     def _handle_task(self, task: Dict[str, Any]):
@@ -196,7 +222,7 @@ class RobotAgent:
                     reject = (f"stale task: arrived {time.time() - expires:.0f}s after its accept "
                               f"deadline (robot was offline, or clocks are not NTP-synced)")
                 else:
-                    reject = self._interlock_problem()
+                    reject = self._interlock_problem(task)
             if reject:
                 result = {**base, **failed(reject)}
                 self._remember(key, result)
@@ -324,6 +350,7 @@ def main():
                 "\"allow_sim_in_real_mode\": true in the config for a deliberate stand-in")
     if cfg["driver"].get("type") == "sim" and not config.TEST_MODE and stand_in:
         logger.warning("STAND-IN: %s/%s is SIMULATED but serving REAL jobs", robot_id, subsystem)
+    cfg["driver"].setdefault("_robot_id", robot_id)
     driver = create_driver(cfg["driver"])
     logger.info(config.describe_mode())
 
@@ -351,6 +378,7 @@ def main():
                        heartbeat_s=float(cfg.get("heartbeat_s", 5)),
                        interlock_with=tuple(cfg.get("interlock_with", [])),
                        require_travel_pose=tuple(cfg.get("require_travel_pose", [])),
+                       require_base_at_zone=cfg.get("require_base_at_zone"),
                        clock_skew_tolerance_s=float(cfg.get("clock_skew_tolerance_s", 5)))
     agent.run_forever()
 

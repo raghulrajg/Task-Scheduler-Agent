@@ -13,14 +13,8 @@ Broker selection:
 """
 import json
 import os
-import shutil
-import socket
-import subprocess
-import tempfile
 import threading
 import time
-import uuid
-from dataclasses import dataclass
 
 import pytest
 
@@ -34,98 +28,12 @@ from robot_registry import RobotRegistry
 from scheduler import TaskScheduler
 from validation import SiteConfig
 
-MOSQUITTO = shutil.which("mosquitto") or ("/usr/sbin/mosquitto" if os.path.exists("/usr/sbin/mosquitto") else None)
+from mqtt_fixtures import Broker, broker, clear_retained, purge_sessions, wait_for  # noqa: F401
 
-
-@dataclass
-class Broker:
-    host: str
-    port: int
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 INSTRUCTION = {"product": "ABCD", "source": "manufacturing_1", "quality_check": "quality_station",
                "success_dest": "package_area", "fail_dest": "waste_area"}
-
-
-def wait_for(pred, timeout=10.0, step=0.05):
-    end = time.time() + timeout
-    while time.time() < end:
-        if pred():
-            return True
-        time.sleep(step)
-    return False
-
-
-@pytest.fixture
-def broker(monkeypatch):
-    prefix = f"pytest/{uuid.uuid4().hex[:10]}/"
-    monkeypatch.setattr(config, "TOPIC_PREFIX", prefix)       # isolate this test's traffic
-    host = os.environ.get("TEST_MQTT_HOST")
-    if host:
-        monkeypatch.setattr(config, "MQTT_USERNAME", os.environ.get("TEST_MQTT_USERNAME") or None)
-        monkeypatch.setattr(config, "MQTT_PASSWORD", os.environ.get("TEST_MQTT_PASSWORD") or None)
-        b = Broker(host, int(os.environ.get("TEST_MQTT_PORT", "1883")))
-        yield b
-        clear_retained(b, prefix)
-        return
-    if not MOSQUITTO:
-        pytest.skip("no test broker: set TEST_MQTT_HOST/PORT/USERNAME/PASSWORD (e.g. your EMQX)")
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    d = tempfile.mkdtemp()
-    conf = os.path.join(d, "m.conf")
-    with open(conf, "w") as f:
-        f.write(f"listener {port} 127.0.0.1\nallow_anonymous true\n")
-    proc = subprocess.Popen([MOSQUITTO, "-c", conf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    assert wait_for(lambda: _port_open("127.0.0.1", port), timeout=5)
-    yield Broker("127.0.0.1", port)
-    proc.terminate()
-    proc.wait(5)
-
-
-def _port_open(host, port):
-    try:
-        socket.create_connection((host, port), timeout=0.2).close()
-        return True
-    except OSError:
-        return False
-
-
-def clear_retained(b, prefix):
-    """Remove every retained message this test left under its namespace."""
-    seen = set()
-    c = make_client(f"cleanup_{uuid.uuid4().hex[:8]}", clean_session=True)
-    c.on_connect = lambda cl, u, f, rc, p: cl.subscribe(prefix + "#", qos=1)
-    c.on_message = lambda cl, u, m: seen.add(m.topic) if m.retain else None
-    c.connect(b.host, b.port)
-    c.loop_start()
-    time.sleep(1.0)
-    for t in seen:
-        c.publish(t, b"", qos=1, retain=True).wait_for_publish(3)
-    c.loop_stop()
-    c.disconnect()
-
-
-def purge_sessions(b, client_ids):
-    """Drop the persistent sessions test clients left on the broker."""
-    threads = [threading.Thread(target=_purge_one, args=(b, cid)) for cid in client_ids]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(10)
-
-
-def _purge_one(b, cid):
-    c = make_client("", clean_session=True)
-    c._client_id = cid if isinstance(cid, bytes) else cid.encode()
-    try:
-        c.connect(b.host, b.port)
-        c.loop_start()
-        time.sleep(0.2)
-        c.loop_stop()
-        c.disconnect()
-    except OSError:
-        pass
 
 
 class Listener:
@@ -423,4 +331,84 @@ def test_full_job_with_dobot_and_web_amr_drivers(broker, tmp_path, monkeypatch):
     finally:
         stack.close()
         amr.close()
+        arm.close()
+
+
+def test_robot_01_as_deployed_onix_dobot_mqtt_scanner(broker, tmp_path):
+    """The real deployment shape over the broker: ONIX base (onix driver vs the
+    ONIX simulator, x/y/theta from stations.json, verified arrival), Dobot arm
+    (dobot driver vs the fake controller, only acts when the base reports it is
+    at the zone), QC over MQTT only (mqtt_inspection driver <-> scanner_bridge.py)."""
+    import math
+    import subprocess
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from drivers import create_driver
+    from fake_dobot import FakeDobot
+    from tools.onix_simulator import OnixSimulator
+
+    poses = {"manufacturing_1": (1.0, 0.0, 0.0), "quality_station": (1.0, 1.0, math.pi / 2),
+             "package_area": (0.0, 1.0, math.pi), "waste_area": (-0.5, 0.0, -math.pi / 2)}
+    stations_file = tmp_path / "stations.json"
+    stations_file.write_text(json.dumps({
+        "defaults": {"xy_tolerance_m": 0.1, "yaw_tolerance_deg": 5}, "stations": {},
+        "locations": {**{k: {"x": x, "y": y, "theta": t} for k, (x, y, t) in poses.items()},
+                      "rest_position": {"station": None, "x": None, "y": None, "theta": None}}}))
+    onix = OnixSimulator(map_body={"header": {}, "advancedPointList": []}, start=(0.0, 0.0, 0.0),
+                         speed=3.0, turn_speed=4.0, status_hz=20)
+    arm = FakeDobot(run_time=0.2, projects=("pick_mfg", "place_pkg", "place_waste"))
+    bridge = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "scanner_bridge.py"), "--station",
+                               "qc_01", "--heartbeat", "1", "--command", "echo PASS"],
+                              env=broker.env(), cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    stack = Stack(broker, str(tmp_path), start_agents=False)
+    try:
+        amr_drv = create_driver({"type": "onix", "host": "127.0.0.1", "ports": onix.ports,
+                                 "stations_file": str(stations_file), "settle_s": 0.3, "start_timeout_s": 5})
+        arm_drv = create_driver({
+            "type": "dobot", "host": "127.0.0.1", "port": arm.port, "protocol": "v4",
+            "projects": {"pick": {"manufacturing_1": "pick_mfg"},
+                         "place": {"package_area": "place_pkg", "waste_area": "place_waste"}},
+            "travel_joints": [0, -30, 120, 0, 90, 0], "poll_interval_s": 0.05})
+        qc_drv = create_driver({"type": "mqtt_inspection", "station": "qc_01", "timeout_s": 10,
+                                "_mqtt_host": broker.host, "_mqtt_port": broker.port})
+        stack.add_driver_agent("robot_01", "amr", amr_drv, siblings=("arm",), require_travel_pose=("arm",))
+        arm_agent = RobotAgent("robot_01", "arm", arm_drv, heartbeat_s=1, interlock_with=("amr",),
+                               require_base_at_zone="amr", client_id=f"agent_robot_01_arm_{time.time_ns()}",
+                               host=broker.host, port=broker.port)
+        arm_agent.start()
+        stack.agents[("robot_01", "arm")] = arm_agent
+        stack.add_driver_agent("qc_01", "scanner", qc_drv)
+
+        def healthy(rid):
+            return next(r for r in stack.registry.fleet_view() if r["id"] == rid)["healthy"]
+        assert wait_for(lambda: healthy("robot_01") and healthy("qc_01"), 15), stack.registry.fleet_view()
+        assert wait_for(lambda: stack.registry.reachable_locations() == set(poses), 5)
+
+        ev = Listener(broker, [config.topic(config.EVENT_TOPIC)])
+        # rest_position has no coordinates yet -> refused before anything moves
+        ev.publish(config.topic(config.INSTRUCTION_TOPIC), {**INSTRUCTION, "fail_dest": "rest_position"})
+        assert wait_for(lambda: stack.rejected, 5)
+        assert "no mobile base has coordinates for ['rest_position']" in stack.rejected[0]
+
+        ev.publish(config.topic(config.INSTRUCTION_TOPIC), {**INSTRUCTION, "request_id": "onix-1"})
+        assert wait_for(lambda: any(e["event"] in ("task_completed", "task_failed")
+                                    for e in ev.json(config.topic(config.EVENT_TOPIC))), 60), \
+            [(e["event"], e.get("error") or e.get("reason")) for e in ev.json(config.topic(config.EVENT_TOPIC))]
+        events = ev.json(config.topic(config.EVENT_TOPIC))
+        done = [e for e in events if e["event"] == "task_completed"]
+        assert done and done[0]["branch"] == "success", [(e["event"], e.get("error")) for e in events]
+        assert "subtask_retry" not in [e["event"] for e in events], [e for e in events
+                                                                      if e["event"] == "subtask_retry"]
+        goals = [r["free_nav"] for a, r in onix.requests if a == "4002"]
+        assert [(g["linear_x"], g["linear_y"], g["angular_z"]) for g in goals] == [
+            poses["manufacturing_1"], poses["quality_station"], poses["package_area"]]
+        assert 'RunScript("pick_mfg")' in arm.commands and 'RunScript("place_pkg")' in arm.commands
+        st = onix.status()
+        assert math.hypot(st["x"] - 0.0, st["y"] - 1.0) < 0.1      # parked at package_area
+        ev.close()
+    finally:
+        stack.close()
+        bridge.terminate()
+        bridge.wait(10)
+        onix.close()
         arm.close()

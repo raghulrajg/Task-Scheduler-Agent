@@ -1,5 +1,10 @@
 # Capturing the mobile robot's web API
 
+> **robot_01 is done:** its base turned out to be an **ONIX** robot, and its
+> API (WebSocket nav/status, HTTP map) is now driven by `drivers/onix.py`
+> with the coordinates in `stations.json` (README 3.4). This guide is kept for
+> other web-dashboard robots, which the generic `http_amr` driver can drive.
+
 The mobile robot is driven from a web dashboard that it hosts itself. That
 page talks to an API on the robot, and the `http_amr` driver can use the same
 API. This guide records what the page sends, so that the driver config can be

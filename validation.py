@@ -67,12 +67,18 @@ class SiteConfig:
 
 
 def validate_instruction(instruction: Any, site: SiteConfig,
-                         inspection_zones: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+                         inspection_zones: Optional[Iterable[str]] = None,
+                         reachable_locations: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     """Returns a cleaned copy of the instruction or raises InstructionError.
 
     inspection_zones: zones where at least one QC-capable robot can work. When
     given, quality_check must be one of them -- otherwise the carrier would
     drive there and wait forever for an inspector that can never come.
+
+    reachable_locations: locations that at least one mobile base has x, y,
+    theta coordinates for (reported in its heartbeat from stations.json).
+    When given, every location of the job must be one of them -- a job is
+    refused up front instead of failing halfway with a part on board.
     """
     if not isinstance(instruction, dict):
         raise InstructionError(f"instruction must be a JSON object, got {type(instruction).__name__}")
@@ -101,6 +107,15 @@ def validate_instruction(instruction: Any, site: SiteConfig,
         if "*" not in zones and clean["quality_check"] not in zones:
             raise InstructionError(
                 f"no QC station operates at {clean['quality_check']!r}; QC zones: {sorted(zones)}")
+
+    if reachable_locations is not None:
+        reachable = set(reachable_locations)
+        missing = [clean[k] for k in ("source", "quality_check", "success_dest", "fail_dest")
+                   if clean[k] not in reachable]
+        if missing:
+            raise InstructionError(
+                f"no mobile base has coordinates for {sorted(set(missing))}: assign or teach them with "
+                f"tools/amr_stations.py (stations.json); locations with coordinates: {sorted(reachable)}")
 
     if clean["success_dest"] == clean["fail_dest"]:
         raise InstructionError("success_dest and fail_dest must differ (otherwise rejected parts mix with good ones)")
