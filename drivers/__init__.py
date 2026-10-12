@@ -12,6 +12,8 @@ from drivers.base import Driver
 
 _ENV_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
+DRIVER_TYPES = ("sim", "onix", "dobot", "mqtt_inspection", "conveyor_inspection", "http_amr", "mir", "ur")
+
 
 def _resolve_env(value: Any) -> Any:
     """Replace "${VAR}" strings with environment values, recursively, so
@@ -53,4 +55,7 @@ def create_driver(cfg: Dict[str, Any]) -> Driver:
     if kind == "mqtt_inspection":
         from drivers.mqtt_inspection import MqttInspectionDriver
         return MqttInspectionDriver(cfg)
-    raise ValueError(f"unknown driver type {kind!r}; expected sim|onix|dobot|mqtt_inspection|http_amr|mir|ur")
+    if kind == "conveyor_inspection":
+        from drivers.conveyor import ConveyorInspectionDriver
+        return ConveyorInspectionDriver(cfg)
+    raise ValueError(f"unknown driver type {kind!r}; expected {'|'.join(DRIVER_TYPES)}")

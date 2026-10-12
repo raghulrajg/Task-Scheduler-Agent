@@ -39,6 +39,12 @@ What it guarantees, and why each part exists on a real shop floor:
    missing/garbled result is a QC *failure* (retried, then escalated), never
    a silent pass.
 
+   Conveyor QC stations (site.json "conveyor"): the carrier places the part
+   on the belt, the station reports the conveyor's verdict, and the carrier
+   picks the part up at the belt exit. The QC dispatch carries "not_before"
+   = when the load step was dispatched, so the station only accepts a
+   conveyor result produced after this part was handed over.
+
 7. PERSISTENCE. All task/robot state is written to disk after every change
    and restored on start, so a scheduler restart doesn't forget that a robot
    is mid-task with a product on board.
@@ -96,7 +102,7 @@ class TaskScheduler:
             instruction, self.site,
             inspection_zones=self.registry.zones_with_capability("quality_check"),
             reachable_locations=self.registry.reachable_locations())
-        subtasks = decompose(clean)
+        subtasks = decompose(clean, self.site)
         task_id = subtasks[0]["task_id"]
         now = self._clock()
         with self._lock:
@@ -287,8 +293,7 @@ class TaskScheduler:
             # coordinates for every place the job can take it.
             places = None
             if sub["group"] == "carrier":
-                ins = task["instruction"]
-                places = [ins[k] for k in ("source", "quality_check", "success_dest", "fail_dest")]
+                places = self.site.job_locations(task["instruction"])
             try:
                 robot = self.allocator.allocate(sub, locations=places)
             except AllocationError as e:
@@ -306,6 +311,11 @@ class TaskScheduler:
         accept_timeout = self.site.timeout_for("accept")
         message = dict(sub)
         message.update(type="task", dispatched_at=now, expires_at=now + accept_timeout)
+        prev = task["subtasks"].get(sub["depends_on"]) if sub["depends_on"] else None
+        if sub["action"] == "quality_check" and prev and prev.get("handover") == "load":
+            # the conveyor verdict for THIS part can only come after it was put on the belt
+            message["not_before"] = prev.get("dispatched_at")
+        sub["dispatched_at"] = now
         self._in_flight[sid] = {
             "task_id": task_id, "robot_id": robot.id, "subsystem": subsystem,
             "attempt": sub["attempt"], "action": sub["action"],
@@ -338,11 +348,14 @@ class TaskScheduler:
                 return
             task["branch"] = "success" if passed else "fail"
             logger.info("Task %s QC -> %s", task["task_id"], task["branch"])
-            self._event("qc_result", task["task_id"], passed=passed, robot_id=robot_id)
+            self._event("qc_result", task["task_id"], passed=passed, robot_id=robot_id,
+                        details=result.get("details"))
 
         task["completed"].append(sid)
         if sub["group"] == "carrier" and sub["action"] == "pick":
             task["product_on_board"] = True
+        elif sub["group"] == "carrier" and sub["action"] == "place":
+            task["product_on_board"] = False   # e.g. put on a QC conveyor; picked up again later
         if sub["releases_robot"]:
             if sub["group"] == "carrier":
                 task["product_on_board"] = False
@@ -387,14 +400,22 @@ class TaskScheduler:
         logger.error("Task %s: %s failed on %s after retries: %s", task_id, sid, robot_id, reason)
         if sub["group"] == "inspector":
             self.registry.set_status(robot_id, "error", f"QC failed: {reason}")
-            if task["carrier_robot"]:
-                self.registry.set_status(task["carrier_robot"], "error",
-                                         f"holding product of failed task {task_id} at QC")
+            carrier = task["carrier_robot"]
+            if carrier and not task["product_on_board"]:
+                # the part is on the QC conveyor, not on the robot: a human
+                # recovers it from the station, the empty carrier can work on
+                reason = f"{reason} (product left on the QC station at {sub['zone']})"
+            elif carrier:
+                self.registry.set_status(carrier, "error", f"holding product of failed task {task_id} at QC")
             self._fail_task(task, f"{action} failed: {reason}")
+            if carrier and not task["product_on_board"]:
+                self.registry.mark_idle(carrier)
+                task["carrier_robot"] = None
             return
 
         # carrier
-        pre_pick = not task["product_on_board"] and action == "navigate"
+        picked_up = any(task["subtasks"][s]["action"] == "pick" for s in task["completed"])
+        pre_pick = not task["product_on_board"] and action == "navigate" and not picked_up
         self.registry.set_status(robot_id, "error", f"{action} failed: {reason}")
         if pre_pick and task["reassignments"] < self.site.max_task_reassignments:
             task["reassignments"] += 1

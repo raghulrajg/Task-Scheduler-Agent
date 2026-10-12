@@ -1,0 +1,20 @@
+{
+  "_comment": "QC station qc_01 = the conveyor agent (Arduino Opta + Hikrobot SC3000, github.com/raghulrajg/conveyor_agent). The Opta publishes one verdict per part on autonomous/product/Transformation; this agent turns the first verdict after the robot loaded the part into the QC result. Run it on the central server: python3 launch.py agents agents/qc_01_conveyor.json (systemd: robot-fleet-agent@qc_01_conveyor). Run only ONE qc_01_* agent at a time (this one, qc_01_scanner.json or qc_01_stand_in.json). The Opta sketch's MQTT_BROKER_IP / MQTT_TOPIC must match .env and result_topic.",
+  "robot_id": "qc_01",
+  "subsystem": "scanner",
+  "heartbeat_s": 5,
+  "driver": {
+    "type": "conveyor_inspection",
+    "station": "qc_01",
+    "result_topic": "autonomous/product/Transformation",
+    "namespaced": true,
+    "verdict_field": "result",
+    "pass_values": ["OK"],
+    "fail_values": ["NG"],
+    "invalid_is_fail": true,
+    "timeout_s": 60,
+    "lookback_s": 30,
+    "clock_skew_s": 2,
+    "announce": true
+  }
+}

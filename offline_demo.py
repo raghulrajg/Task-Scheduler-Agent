@@ -197,7 +197,8 @@ def sc_pick_fail():
 
 
 def sc_qc_no_result():
-    """QC station answers 'done' but with no pass/fail -> NOT treated as a pass."""
+    """QC station answers 'done' but with no pass/fail -> NOT treated as a pass. The QC
+    station is flagged 'error'; the part is left on the conveyor, so the empty robot is released."""
     def policy(robot, sub, msg):
         if msg["action"] == "quality_check":
             return "done", {}
@@ -206,7 +207,9 @@ def sc_qc_no_result():
     tid = sim.sched.submit_instruction(JOB)
     sim.run()
     t = sim.sched.get_task(tid)
-    return t["state"] == "failed" and t["branch"] is None and sim.status("robot_01") == "error"
+    say(f"  qc_01 status: {sim.status('qc_01')}; robot_01 status: {sim.status('robot_01')}")
+    carrier_ok = sim.status("robot_01") == ("idle" if sim.site.conveyor_for(JOB["quality_check"]) else "error")
+    return t["state"] == "failed" and t["branch"] is None and sim.status("qc_01") == "error" and carrier_ok
 
 
 def sc_robot_silent():

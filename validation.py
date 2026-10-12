@@ -13,7 +13,7 @@ single subtask is dispatched.
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 REQUIRED_KEYS = ("product", "source", "quality_check", "success_dest", "fail_dest")
 _PRODUCT_RE = re.compile(r"^[A-Za-z0-9 _\-.]{1,64}$")
@@ -48,6 +48,16 @@ class SiteConfig:
         locations = data.get("locations")
         if not isinstance(locations, dict) or not locations:
             raise ValueError("site config must define a non-empty 'locations' object")
+        for name, meta in locations.items():
+            conv = meta.get("conveyor") if isinstance(meta, dict) else None
+            if conv in (None, False, True):
+                continue
+            if not isinstance(conv, dict):
+                raise ValueError(f"locations.{name}.conveyor must be true or an object")
+            exit_loc = conv.get("exit_location")
+            if exit_loc is not None and (exit_loc not in locations or exit_loc == name):
+                raise ValueError(f"locations.{name}.conveyor.exit_location {exit_loc!r} must be another "
+                                 f"location in site.json")
         return cls(
             locations=locations,
             timeouts_s={**DEFAULT_TIMEOUTS, **data.get("timeouts_s", {})},
@@ -64,6 +74,26 @@ class SiteConfig:
 
     def retries_for(self, action: str) -> int:
         return int(self.max_retries.get(action, 0))
+
+    def conveyor_for(self, location: str) -> Optional[Dict[str, Any]]:
+        """The conveyor settings of a QC location, or None when the part is
+        inspected while the robot holds it. With a conveyor, the carrier
+        places the part on the belt, the conveyor runs it past the camera,
+        and the carrier picks it up again at the exit (exit_location, or the
+        same location when that is null)."""
+        conv = (self.locations.get(location) or {}).get("conveyor")
+        if conv is None or conv is False:
+            return None
+        return dict(conv) if isinstance(conv, dict) else {}
+
+    def job_locations(self, instruction: Dict[str, Any]) -> List[str]:
+        """Every location the carrier robot may drive to for this job."""
+        places = [instruction["source"], instruction["quality_check"]]
+        exit_loc = (self.conveyor_for(instruction["quality_check"]) or {}).get("exit_location")
+        if exit_loc:
+            places.append(exit_loc)
+        places += [instruction["success_dest"], instruction["fail_dest"]]
+        return list(dict.fromkeys(places))
 
 
 def validate_instruction(instruction: Any, site: SiteConfig,
@@ -110,8 +140,7 @@ def validate_instruction(instruction: Any, site: SiteConfig,
 
     if reachable_locations is not None:
         reachable = set(reachable_locations)
-        missing = [clean[k] for k in ("source", "quality_check", "success_dest", "fail_dest")
-                   if clean[k] not in reachable]
+        missing = [loc for loc in site.job_locations(clean) if loc not in reachable]
         if missing:
             raise InstructionError(
                 f"no mobile base has coordinates for {sorted(set(missing))}: assign or teach them with "

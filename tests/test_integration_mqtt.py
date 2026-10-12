@@ -35,6 +35,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INSTRUCTION = {"product": "ABCD", "source": "manufacturing_1", "quality_check": "quality_station",
                "success_dest": "package_area", "fail_dest": "waste_area"}
 
+# Dobot projects for site.json as shipped: quality_station is a conveyor, so the
+# arm also puts the part on the belt and takes it off at the exit there.
+CONVEYOR_PROJECTS = ("pick_mfg", "place_belt", "pick_belt", "place_pkg", "place_waste")
+DOBOT_PROJECTS = {"pick": {"manufacturing_1": "pick_mfg", "quality_station": "pick_belt"},
+                  "place": {"quality_station": "place_belt", "package_area": "place_pkg", "waste_area": "place_waste"}}
+
 
 class Listener:
     def __init__(self, broker, topics):
@@ -67,10 +73,10 @@ class Listener:
 class Stack:
     """Scheduler + one sim agent per subsystem, wired over the broker."""
 
-    def __init__(self, broker, tmpdir, durations=0.1, qc_pass_rate=1.0, start_agents=True):
+    def __init__(self, broker, tmpdir, durations=0.1, qc_pass_rate=1.0, start_agents=True, site=None):
         self.broker = broker
         self.host, self.port = broker.host, broker.port
-        site = SiteConfig.load("site.json")
+        site = site or SiteConfig.load("site.json")
         self.registry = RobotRegistry("robots_metadata.json", require_heartbeat=True,
                                       heartbeat_timeout_s=site.heartbeat_timeout_s,
                                       min_battery_percent=site.min_battery_percent)
@@ -285,7 +291,7 @@ def test_full_job_with_dobot_and_web_amr_drivers(broker, tmp_path, monkeypatch):
     from fake_dobot import FakeDobot
 
     amr = FakeAMR(points=("station_A", "station_B", "station_C", "station_D"), drive_time=0.3, pickup_delay=0.1)
-    arm = FakeDobot(run_time=0.2, projects=("pick_mfg", "place_pkg", "place_waste"))
+    arm = FakeDobot(run_time=0.2, projects=CONVEYOR_PROJECTS)
     monkeypatch.setenv("TEST_AMR_PW", "pw{1}")
     stack = Stack(broker, str(tmp_path), start_agents=False)
     try:
@@ -306,8 +312,7 @@ def test_full_job_with_dobot_and_web_amr_drivers(broker, tmp_path, monkeypatch):
             "poll_interval_s": 0.05, "settle_s": 1.0})
         arm_drv = create_driver({
             "type": "dobot", "host": "127.0.0.1", "port": arm.port, "protocol": "v4",
-            "projects": {"pick": {"manufacturing_1": "pick_mfg"},
-                         "place": {"package_area": "place_pkg", "waste_area": "place_waste"}},
+            "projects": DOBOT_PROJECTS,
             "travel_joints": [0, -30, 120, 0, 90, 0], "poll_interval_s": 0.05})
         stack.add_driver_agent("robot_01", "amr", amr_drv, siblings=("arm",), require_travel_pose=("arm",))
         stack.add_driver_agent("robot_01", "arm", arm_drv, siblings=("amr",))
@@ -334,11 +339,17 @@ def test_full_job_with_dobot_and_web_amr_drivers(broker, tmp_path, monkeypatch):
         arm.close()
 
 
-def test_robot_01_as_deployed_onix_dobot_mqtt_scanner(broker, tmp_path):
+@pytest.mark.parametrize("qc", ["conveyor", "scanner_bridge"])
+def test_robot_01_as_deployed_onix_dobot_qc(broker, tmp_path, qc):
     """The real deployment shape over the broker: ONIX base (onix driver vs the
     ONIX simulator, x/y/theta from stations.json, verified arrival), Dobot arm
     (dobot driver vs the fake controller, only acts when the base reports it is
-    at the zone), QC over MQTT only (mqtt_inspection driver <-> scanner_bridge.py)."""
+    at the zone), and QC over MQTT only:
+      conveyor        site.json as shipped: the arm puts the part on the belt, the
+                      conveyor_inspection driver takes the simulated Opta's verdict
+                      (tools/conveyor_sim.py), the arm takes the part off the belt;
+      scanner_bridge  part inspected in the gripper: mqtt_inspection driver <->
+                      tools/scanner_bridge.py."""
     import math
     import subprocess
     import sys
@@ -356,21 +367,32 @@ def test_robot_01_as_deployed_onix_dobot_mqtt_scanner(broker, tmp_path):
                       "rest_position": {"station": None, "x": None, "y": None, "theta": None}}}))
     onix = OnixSimulator(map_body={"header": {}, "advancedPointList": []}, start=(0.0, 0.0, 0.0),
                          speed=3.0, turn_speed=4.0, status_hz=20)
-    arm = FakeDobot(run_time=0.2, projects=("pick_mfg", "place_pkg", "place_waste"))
-    bridge = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "scanner_bridge.py"), "--station",
-                               "qc_01", "--heartbeat", "1", "--command", "echo PASS"],
-                              env=broker.env(), cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    stack = Stack(broker, str(tmp_path), start_agents=False)
+    arm = FakeDobot(run_time=0.2, projects=CONVEYOR_PROJECTS)
+    site = SiteConfig.load("site.json")
+    if qc == "conveyor":
+        helper = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "conveyor_sim.py"), "--station",
+                                   "qc_01", "--pass-rate", "1", "--delay", "0.3"],
+                                  env={**broker.env(), "RUN_MODE": "test"}, cwd=ROOT,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        qc_cfg = {"type": "conveyor_inspection", "station": "qc_01", "timeout_s": 10}
+        projects = DOBOT_PROJECTS
+    else:
+        for meta in site.locations.values():
+            meta.pop("conveyor", None)
+        helper = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "scanner_bridge.py"), "--station",
+                                   "qc_01", "--heartbeat", "1", "--command", "echo PASS"],
+                                  env=broker.env(), cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        qc_cfg = {"type": "mqtt_inspection", "station": "qc_01", "timeout_s": 10}
+        projects = {"pick": {"manufacturing_1": "pick_mfg"},
+                    "place": {"package_area": "place_pkg", "waste_area": "place_waste"}}
+    stack = Stack(broker, str(tmp_path), start_agents=False, site=site)
     try:
         amr_drv = create_driver({"type": "onix", "host": "127.0.0.1", "ports": onix.ports,
                                  "stations_file": str(stations_file), "settle_s": 0.3, "start_timeout_s": 5})
         arm_drv = create_driver({
             "type": "dobot", "host": "127.0.0.1", "port": arm.port, "protocol": "v4",
-            "projects": {"pick": {"manufacturing_1": "pick_mfg"},
-                         "place": {"package_area": "place_pkg", "waste_area": "place_waste"}},
-            "travel_joints": [0, -30, 120, 0, 90, 0], "poll_interval_s": 0.05})
-        qc_drv = create_driver({"type": "mqtt_inspection", "station": "qc_01", "timeout_s": 10,
-                                "_mqtt_host": broker.host, "_mqtt_port": broker.port})
+            "projects": projects, "travel_joints": [0, -30, 120, 0, 90, 0], "poll_interval_s": 0.05})
+        qc_drv = create_driver({**qc_cfg, "_mqtt_host": broker.host, "_mqtt_port": broker.port})
         stack.add_driver_agent("robot_01", "amr", amr_drv, siblings=("arm",), require_travel_pose=("arm",))
         arm_agent = RobotAgent("robot_01", "arm", arm_drv, heartbeat_s=1, interlock_with=("amr",),
                                require_base_at_zone="amr", client_id=f"agent_robot_01_arm_{time.time_ns()}",
@@ -383,6 +405,7 @@ def test_robot_01_as_deployed_onix_dobot_mqtt_scanner(broker, tmp_path):
             return next(r for r in stack.registry.fleet_view() if r["id"] == rid)["healthy"]
         assert wait_for(lambda: healthy("robot_01") and healthy("qc_01"), 15), stack.registry.fleet_view()
         assert wait_for(lambda: stack.registry.reachable_locations() == set(poses), 5)
+        time.sleep(1.0)    # let the QC helper subscribe
 
         ev = Listener(broker, [config.topic(config.EVENT_TOPIC)])
         # rest_position has no coordinates yet -> refused before anything moves
@@ -402,13 +425,20 @@ def test_robot_01_as_deployed_onix_dobot_mqtt_scanner(broker, tmp_path):
         goals = [r["free_nav"] for a, r in onix.requests if a == "4002"]
         assert [(g["linear_x"], g["linear_y"], g["angular_z"]) for g in goals] == [
             poses["manufacturing_1"], poses["quality_station"], poses["package_area"]]
-        assert 'RunScript("pick_mfg")' in arm.commands and 'RunScript("place_pkg")' in arm.commands
+        scripts = [c for c in arm.commands if c.startswith("RunScript")]
+        if qc == "conveyor":
+            assert scripts == ['RunScript("pick_mfg")', 'RunScript("place_belt")', 'RunScript("pick_belt")',
+                               'RunScript("place_pkg")'], scripts
+            qc_event = next(e for e in events if e["event"] == "qc_result")
+            assert qc_event["details"]["result"] == "OK" and qc_event["details"]["valid"] is True
+        else:
+            assert scripts == ['RunScript("pick_mfg")', 'RunScript("place_pkg")'], scripts
         st = onix.status()
         assert math.hypot(st["x"] - 0.0, st["y"] - 1.0) < 0.1      # parked at package_area
         ev.close()
     finally:
         stack.close()
-        bridge.terminate()
-        bridge.wait(10)
+        helper.terminate()
+        helper.wait(10)
         onix.close()
         arm.close()

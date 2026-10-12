@@ -1,0 +1,223 @@
+"""
+drivers/conveyor.py
+-------------------
+Quality check on a CONVEYOR with a camera: the conveyor agent
+(github.com/raghulrajg/conveyor_agent -- Arduino Opta + Hikrobot SC3000)
+runs the part from the entry sensor S1 to the camera at S2, reads the
+camera's x;y;theta;result and publishes one MQTT message per part:
+
+    autonomous/product/Transformation
+    {"x":12.500,"y":30.200,"theta":45.000,"result":"OK","valid":true,"cycle":5,"raw":"12.5;30.2;45.0;OK;"}
+    {"x":null,"y":null,"theta":null,"result":"NG","valid":false,"cycle":7,"raw":"garbage"}
+
+The Opta does not take requests and does not echo a request id: it simply
+publishes a verdict whenever a part passes the camera. So this driver
+correlates by TIME. Before the inspection, the carrier robot placed the part
+on the belt (the scheduler's "load" step); the scheduler sends the QC step
+with not_before = when that load step was dispatched. The driver takes the
+FIRST conveyor result received at or after not_before that no earlier
+inspection has used. Results are buffered as they arrive, so a verdict that
+comes in before the QC step is dispatched (fast belt, slow arm retract) is
+not lost.
+
+Fail-safe rules:
+  * "valid": false (the camera sent something that is not x;y;theta;result)
+    is a FAIL verdict by default (invalid_is_fail): the part goes to the
+    fail destination, never to packaging. The part has already left the
+    camera, so re-inspecting it is not possible.
+  * a verdict outside pass_values / fail_values is a failed inspection.
+  * no result within timeout_s is a failed inspection (the scheduler retries,
+    then escalates).
+  * retained messages are ignored (they are old by definition).
+
+Config (agents/qc_01_conveyor.json):
+{
+  "type": "conveyor_inspection",
+  "station": "qc_01",
+  "result_topic": "autonomous/product/Transformation",   # MQTT_TOPIC in the Opta sketch
+  "namespaced": true,        # true: topic gets the run mode prefix ("sim/..." in TEST mode)
+  "verdict_field": "result",
+  "pass_values": ["OK"],
+  "fail_values": ["NG"],
+  "invalid_is_fail": true,
+  "timeout_s": 60,           # from QC dispatch; the Opta itself faults after 15 s travel + 10 s camera
+  "lookback_s": 30,          # used only when the QC step has no not_before
+  "clock_skew_s": 2,         # tolerance on not_before (scheduler and agent clocks, NTP)
+  "announce": true           # also publish qc/<station>/request (for dashboards and tools/conveyor_sim.py)
+}
+"""
+
+import json
+import logging
+import threading
+import time
+import uuid
+from collections import deque
+from typing import Any, Deque, Dict, Optional
+
+from drivers.base import Driver, cancelled, done, failed, robot_state
+from drivers.util import dig, matches
+
+logger = logging.getLogger("driver.conveyor")
+
+DEFAULT_TOPIC = "autonomous/product/Transformation"
+BUFFER_S = 600          # forget results older than this
+BUFFER_MAX = 200
+DUPLICATE_S = 5.0       # same cycle + raw within this window = a duplicate delivery
+
+
+class ConveyorInspectionDriver(Driver):
+    actions = ("quality_check",)
+
+    def __init__(self, cfg: Dict[str, Any], clock=time.time):
+        super().__init__(cfg)
+        import config
+        from mqtt_common import connected_ok, guarded, make_client, start
+        self.station = cfg.get("station") or cfg.get("_robot_id") or "qc_01"
+        raw_topic = cfg.get("result_topic") or DEFAULT_TOPIC
+        self.result_topic = config.topic(raw_topic) if cfg.get("namespaced", True) else raw_topic
+        self.request_topic = config.topic(f"qc/{self.station}/request") if cfg.get("announce", True) else None
+        self._field = cfg.get("verdict_field", "result")
+        self._pass_values = cfg.get("pass_values", ["OK"])
+        self._fail_values = cfg.get("fail_values", ["NG"])
+        self._invalid_is_fail = bool(cfg.get("invalid_is_fail", True))
+        self._timeout = float(cfg.get("timeout_s", 60))
+        self._lookback = float(cfg.get("lookback_s", 30))
+        self._skew = float(cfg.get("clock_skew_s", 2))
+        self._clock = clock
+
+        self._cond = threading.Condition()
+        self._results: Deque[Dict[str, Any]] = deque()       # {"seq","t","payload","used"}
+        self._seq = 0
+        self._last: Optional[Dict[str, Any]] = None
+        self.connected = False
+        self._connected_ok = connected_ok
+        self._created = time.time()
+
+        self._client = make_client(f"conveyor_{self.station}_{uuid.uuid4().hex[:6]}", clean_session=True)
+        self._client.on_connect = guarded(self._on_connect)
+        self._client.on_disconnect = guarded(self._on_disconnect)
+        self._client.on_message = guarded(self._on_message)
+        start(self._client, cfg.get("_mqtt_host"), cfg.get("_mqtt_port"))
+
+    # ---- MQTT ------------------------------------------------------------------------------
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        if not self._connected_ok(reason_code):
+            logger.error("conveyor link: MQTT connect refused: %s", reason_code)
+            return
+        self.connected = True
+        client.subscribe(self.result_topic, qos=1)
+        logger.info("listening for conveyor results on %s", self.result_topic)
+
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties):
+        self.connected = False
+
+    def _on_message(self, client, userdata, msg):
+        if msg.retain:
+            logger.info("ignoring retained (old) message on %s", msg.topic)
+            return
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            logger.warning("non-JSON conveyor message on %s ignored: %r", msg.topic, msg.payload[:120])
+            return
+        if not isinstance(payload, dict):
+            return
+        self.add_result(payload)
+
+    def add_result(self, payload: Dict[str, Any], t: Optional[float] = None) -> bool:
+        """Store one conveyor result. Returns False for a duplicate delivery."""
+        t = self._clock() if t is None else t
+        with self._cond:
+            key = (payload.get("cycle"), payload.get("raw"))
+            for r in reversed(self._results):
+                if t - r["t"] > DUPLICATE_S:
+                    break
+                if key != (None, None) and (r["payload"].get("cycle"), r["payload"].get("raw")) == key:
+                    return False
+            self._seq += 1
+            entry = {"seq": self._seq, "t": t, "payload": payload, "used": False}
+            self._results.append(entry)
+            self._last = entry
+            while self._results and (len(self._results) > BUFFER_MAX or t - self._results[0]["t"] > BUFFER_S):
+                self._results.popleft()
+            self._cond.notify_all()
+        logger.info("conveyor result #%d: %s", entry["seq"], payload)
+        return True
+
+    def _take(self, since: float) -> Optional[Dict[str, Any]]:
+        """First unused result received at or after `since` (self._cond held)."""
+        for r in self._results:
+            if not r["used"] and r["t"] >= since:
+                r["used"] = True
+                return r
+        return None
+
+    def _startup_wait(self, window: float = 5.0) -> None:
+        end = self._created + window
+        while time.time() < end and not self.connected:
+            time.sleep(0.05)
+
+    # ---- Driver API ---------------------------------------------------------------------------
+    def execute(self, subtask: Dict[str, Any], cancel: threading.Event) -> Dict[str, Any]:
+        self._startup_wait()
+        start = self._clock()
+        not_before = subtask.get("not_before")
+        since = (float(not_before) if isinstance(not_before, (int, float)) else start - self._lookback) - self._skew
+        rid = f"{subtask['subtask_id']}#{subtask.get('attempt', 1)}"
+        if self.request_topic and self.connected:
+            request = {"request_id": rid, "subtask_id": subtask["subtask_id"], "product": subtask.get("target"),
+                       "station": subtask.get("zone"), "not_before": since, "ts": start}
+            self._client.publish(self.request_topic, json.dumps(request), qos=1)
+        logger.info("QC %s: waiting for a conveyor result on %s received after %s", rid, self.result_topic,
+                    time.strftime("%H:%M:%S", time.localtime(since)))
+
+        deadline = start + self._timeout
+        with self._cond:
+            while True:
+                entry = self._take(since)
+                if entry is not None:
+                    break
+                if cancel.is_set():
+                    return cancelled()
+                if self._clock() > deadline:
+                    why = "" if self.connected else " (not connected to the MQTT broker)"
+                    return failed(f"no conveyor result on {self.result_topic} within {self._timeout:.0f}s{why}: "
+                                  f"is the part on the belt, the conveyor in fault, or the Opta offline?")
+                self._cond.wait(0.2)
+        return self._verdict(entry, start)
+
+    def _verdict(self, entry: Dict[str, Any], start: float) -> Dict[str, Any]:
+        p = entry["payload"]
+        details = {k: p.get(k) for k in ("x", "y", "theta", "result", "valid", "cycle", "raw")}
+        details["received_at"] = entry["t"]
+        details["waited_s"] = round(max(0.0, entry["t"] - start), 2)
+        if p.get("valid") is False:
+            if self._invalid_is_fail:
+                details["reason"] = "camera message was not x;y;theta;result -- treated as NG"
+                return done({"pass": False, "details": details})
+            return failed(f"conveyor reported an invalid camera message: {p.get('raw')!r}")
+        verdict = dig(p, self._field)
+        if matches(verdict, self._pass_values):
+            return done({"pass": True, "details": details})
+        if matches(verdict, self._fail_values):
+            return done({"pass": False, "details": details})
+        return failed(f"conveyor result has no recognised verdict at '{self._field}': {p!r}"[:300])
+
+    def get_state(self) -> Dict[str, Any]:
+        self._startup_wait()
+        if not self.connected:
+            return robot_state(False, f"not connected to the MQTT broker (conveyor topic {self.result_topic})")
+        with self._cond:
+            last = self._last
+        if last is None:
+            detail = f"listening on {self.result_topic}; no conveyor result yet"
+        else:
+            p = last["payload"]
+            detail = (f"listening on {self.result_topic}; last result {p.get('result')} (cycle {p.get('cycle')}) "
+                      f"{self._clock() - last['t']:.0f}s ago")
+        return robot_state(True, detail)
+
+    def close(self) -> None:
+        from mqtt_common import stop
+        stop(self._client)
