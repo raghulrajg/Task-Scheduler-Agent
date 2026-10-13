@@ -2,7 +2,10 @@
 import os
 import sys
 
-# Never pick up a developer's real .env during tests.
+# Never pick up a developer's or robot PC's real .env during tests (e.g. its
+# REQUIRE_CONFIRMATION=1 would hold back every job the tests submit).
+os.environ["ENV_FILE"] = os.devnull
+os.environ.pop("REQUIRE_CONFIRMATION", None)
 for k in ("MQTT_USERNAME", "MQTT_PASSWORD"):
     os.environ[k] = ""
 os.environ.setdefault("MQTT_TLS", "0")
@@ -55,7 +58,20 @@ INSTRUCTION = {"product": "ABCD", "source": "manufacturing_1", "quality_check": 
 
 @pytest.fixture
 def site():
-    return SiteConfig.load("site.json")
+    """site.json with the QC location as a plain camera station: the part is
+    inspected while the robot holds it (no conveyor load/unload steps)."""
+    s = SiteConfig.load("site.json")
+    for meta in s.locations.values():
+        meta.pop("conveyor", None)
+    return s
+
+
+@pytest.fixture
+def conveyor_site():
+    """site.json exactly as shipped: quality_station is a conveyor."""
+    s = SiteConfig.load("site.json")
+    assert s.conveyor_for("quality_station") is not None
+    return s
 
 
 @pytest.fixture

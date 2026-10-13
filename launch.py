@@ -14,6 +14,7 @@ Broker settings (your EMQX) come from .env.
     python3 launch.py test --with-llm            # ... + reasoning agent (Ollama)
     python3 launch.py test --jobs 5              # ... and submit 5 jobs once everything is up
     python3 launch.py test --hardware agents/robot_01_arm.json   # real Dobot joins, rest simulated
+    python3 launch.py test --conveyor            # real conveyor QC driver + simulated Opta (conveyor flow)
 
   REAL mode (the real robots):
     python3 launch.py server                     # central server: scheduler + reasoning agent
@@ -69,8 +70,10 @@ class Child:
         kwargs = {}
         if os.name == "nt":
             kwargs["creationflags"] = 0  # same console: Ctrl+C reaches the children too
-        self.proc = subprocess.Popen(self.argv, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, bufsize=1, **kwargs)
+        # stdin=DEVNULL: no child reads the keyboard (a key pressed in the launcher
+        # window must never reach e.g. the conveyor simulator's typed commands)
+        self.proc = subprocess.Popen(self.argv, env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1, **kwargs)
         self.started_at = time.time()
         threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
 
@@ -136,6 +139,8 @@ def env_for(mode: str) -> Dict[str, str]:
 def role_test(args):
     env = env_for("test")
     skip, hardware = [], []
+    if args.conveyor and CONVEYOR_AGENT not in args.hardware:
+        args.hardware.append(CONVEYOR_AGENT)
     for cfg_path in args.hardware:
         with open(cfg_path) as f:
             cfg = json.load(f)
@@ -150,6 +155,9 @@ def role_test(args):
     for i, cfg_path in enumerate(hardware):
         name = os.path.splitext(os.path.basename(cfg_path))[0]
         children.append(Child(f"HW {name}", [PY, "robot_agent.py", "--config", cfg_path], env, COLORS[2 + i % 3]))
+    if args.conveyor:
+        children.append(Child("conveyor-sim", [PY, "tools/conveyor_sim.py", "--pass-rate", str(args.qc_pass_rate),
+                                               "--delay", str(max(0.2, 2 / args.speed))], env, COLORS[4]))
     if args.with_llm:
         children.append(Child("reasoning", [PY, "reasoning_agent.py"], env, COLORS[5]))
 
@@ -163,6 +171,9 @@ def role_test(args):
     out("TEST mode: simulated robots on your broker, isolated under the 'sim/' topics. Ctrl+C to stop.")
     out("Other terminal:  python3 manual_runner.py --test     |  python3 tools/fleetctl.py --test status")
     supervise(children, after_start=submit_jobs if args.jobs else None)
+
+
+CONVEYOR_AGENT = os.path.join("agents", "qc_01_conveyor.json")
 
 
 def role_server(args):
@@ -411,6 +422,8 @@ def main():
     t.add_argument("--fail-rate", type=float, default=0.0, help="probability a simulated action fails")
     t.add_argument("--hardware", action="append", default=[], metavar="AGENT_CONFIG",
                    help="run this REAL agent in the test (its subsystem is not simulated)")
+    t.add_argument("--conveyor", action="store_true",
+                   help=f"QC through the real conveyor driver ({CONVEYOR_AGENT}) and a simulated Opta")
     t.set_defaults(fn=role_test)
 
     s = sub.add_parser("server", help="REAL mode: scheduler (+ reasoning agent)")

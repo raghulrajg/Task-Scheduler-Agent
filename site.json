@@ -1,9 +1,12 @@
 {
-  "_comment": "Site-wide settings shared by scheduler_service.py and reasoning_agent.py. Location names here are the ONLY names the LLM may use and the only ones the scheduler will accept. Each robot agent maps these names to its own vendor targets (MiR mission GUIDs, UR programs) in agents/*.json.",
+  "_comment": "Site-wide settings shared by scheduler_service.py and reasoning_agent.py. Location names here are the ONLY names the LLM may use and the only ones the scheduler will accept. Each robot agent maps these names to its own vendor targets (MiR mission GUIDs, UR programs) in agents/*.json. A QC location with \"conveyor\" is inspected on a conveyor: the robot places the part on the belt there, the conveyor's QC station (conveyor.station, a robot id from robots_metadata.json) gives the verdict, and the robot picks the part up again at the belt exit -- at the same location, or at conveyor.exit_location if the arm cannot reach the exit from there. One part is on the belt at a time. Remove \"conveyor\" if parts are inspected while the robot holds them.",
 
   "locations": {
     "manufacturing_1": { "description": "Output of manufacturing cell 1 (pick-up point)" },
-    "quality_station": { "description": "Vision inspection station" },
+    "quality_station": {
+      "description": "Conveyor with vision inspection (Arduino Opta + Hikrobot SC3000)",
+      "conveyor": { "station": "qc_01", "exit_location": null }
+    },
     "package_area":    { "description": "Packaging drop-off for parts that passed QC" },
     "waste_area":      { "description": "Reject bin for parts that failed QC" },
     "rest_position":   { "description": "Robot parking / charging position" }

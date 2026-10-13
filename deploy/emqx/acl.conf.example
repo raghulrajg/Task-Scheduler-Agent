@@ -22,8 +22,12 @@
 %% ---- robot PCs: each robot only touches its own topics --------------------------
 {allow, {username, "robot_01"}, subscribe, ["robots/robot_01/+/task", "robots/robot_01/+/state"]}.
 {allow, {username, "robot_01"}, publish,   ["robots/robot_01/+/status", "robots/robot_01/+/state"]}.
-{allow, {username, "qc_01"},    subscribe, ["robots/qc_01/+/task"]}.
-{allow, {username, "qc_01"},    publish,   ["robots/qc_01/+/status", "robots/qc_01/+/state"]}.
+{allow, {username, "qc_01"},    subscribe, ["robots/qc_01/+/task", "qc/qc_01/result", "qc/qc_01/status",
+                                            "autonomous/product/Transformation", "scheduler/events"]}.
+{allow, {username, "qc_01"},    publish,   ["robots/qc_01/+/status", "robots/qc_01/+/state", "qc/qc_01/request"]}.
+
+%% ---- conveyor agent (Arduino Opta): one verdict per part -------------------------
+{allow, {username, "opta_conveyor"}, publish, ["autonomous/product/Transformation"]}.
 
 %% ---- TEST mode: everything lives under sim/ --------------------------------------
 {allow, {username, "fleet_test"}, all, ["sim/#"]}.

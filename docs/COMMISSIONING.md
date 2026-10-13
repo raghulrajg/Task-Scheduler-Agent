@@ -3,8 +3,9 @@
 Work through these phases in order. Don't go on to the next phase until the
 current one passes. Each phase adds one source of risk.
 
-The examples assume a mobile robot driven through its web-dashboard API with a
-Dobot Nova 2 on top, and an HTTP or TCP vision station for QC. For other vendors, write a driver (`drivers/base.py`)
+The examples assume the ONIX mobile robot with a Dobot Nova 2 on top, and the
+QC conveyor from the [conveyor agent](https://github.com/raghulrajg/conveyor_agent)
+(Arduino Opta + Hikrobot SC3000) as the QC station. For other vendors, write a driver (`drivers/base.py`)
 and the phases stay the same.
 
 ---
@@ -30,9 +31,11 @@ and the phases stay the same.
 - [ ] E-stops on both the mobile robot and the Dobot are wired and tested. Everyone in the area
       knows where they are.
 - [ ] Reduced-speed / protective-field settings on the mobile robot for each zone.
-- [ ] **Change the MQTT password that was committed to git** (`.env` and the
-      defaults in the old `config.py`). Removing the file doesn't remove it from
-      git history. Treat it as public.
+- [ ] **Change the MQTT password that was committed to git** (`.env`, the
+      defaults in the old `config.py`, and the conveyor agent's sketches and
+      `mqtt_monitor.py`). `.env` is no longer tracked, but the old one stays in
+      git history. Treat that password as public, and put the new one only in
+      each machine's `.env` and in the Opta sketch you upload.
 
 ## 1. Infrastructure
 
@@ -44,8 +47,10 @@ and the phases stay the same.
       reject a task that arrives after its `expires_at`, so clocks must agree
       to within `clock_skew_tolerance_s` (default 5 s).
 - [ ] Network: robot PC ↔ ONIX robot (`172.22.74.119`, TCP 3000, 4000, 7000),
-      robot PC ↔ Dobot controller (TCP 29999), scanner PC ↔ broker, everything
-      ↔ broker (EMQX 1883, or 8883 with TLS). The ONIX API is only on the
+      robot PC ↔ Dobot controller (TCP 29999), **Opta (Wi-Fi) ↔ broker**,
+      everything ↔ broker (EMQX 1883, or 8883 with TLS). The Opta sketch has
+      its own broker address (`MQTT_BROKER_IP`, default 172.16.13.62): it must
+      be the same EMQX as `MQTT_BROKER_HOST` in `.env`. The ONIX API is only on the
       robot's own network, so the robot PC needs an interface on it **and**
       one on the factory network (or use a two-interface gateway PC). Put the
       robots on a dedicated VLAN/SSID. Check Wi-Fi roaming along every route.
@@ -57,6 +62,10 @@ and the phases stay the same.
       sudo -u fleet cp .env.example .env && sudo -u fleet chmod 600 .env   # then edit
       sudo -u fleet venv/bin/python launch.py check                        # preflight
       ```
+      **Already installed from an older version** (when `.env` was still in git)?
+      Update without losing `.env`: follow "Updating an install made before
+      `.env` was untracked" in README section 3.1 (copy `.env` to `.env.keep`,
+      `git checkout -- .env`, `git pull`, copy it back).
 
 ## 2. Simulated end-to-end (no hardware)
 
@@ -66,6 +75,9 @@ and the phases stay the same.
       `pytest/<id>/` topic namespace and clean up after themselves.
 - [ ] `python3 launch.py test --jobs 5` completes 5 jobs on your EMQX, with
       simulated robots under the `sim/` topics.
+- [ ] `python3 launch.py test --conveyor --jobs 5 --qc-pass-rate 0.5`: the same
+      through the real conveyor driver and a simulated Opta; jobs end in
+      `package_area` or `waste_area`.
 - [ ] `python3 launch.py test --fail-rate 0.2 --qc-pass-rate 0.5` for 30
       minutes with jobs submitted regularly (`tools/fleetctl.py --test submit`).
       Check with `tools/fleetctl.py --test status` that failures end in `error`
@@ -132,7 +144,14 @@ and the phases stay the same.
    only while the arm is **disabled**. So start the agent with the arm
    disabled, then enable it, or set `auto_enable`.
 2. Make one **project** per (action, location), e.g.
-   `pick_manufacturing_1`, `place_package_area`, `place_waste_area`.
+   `pick_manufacturing_1`, `place_conveyor_entry` (part onto the belt at S1),
+   `pick_conveyor_exit` (part off the belt at S3), `place_package_area`,
+   `place_waste_area`. `pick_conveyor_exit` must **wait until the part is at
+   S3** before reaching in: wire the S3 sensor also to a Dobot DI (or add an
+   output to the Opta sketch that is on in `AT_EXIT`), wait on it with a timeout, and report failure
+   (`SetOutputInt(0, 2)`) if it never comes. The agent already holds the
+   verdict back by `exit_travel_s`, but the DI is what makes it safe against
+   a slow or jammed belt.
    Blockly projects are addressed as `blockly_<name>`. Each project must:
    - **re-localise first** (camera, marker or fixture), because the base never
      stops in exactly the same place;
@@ -186,27 +205,57 @@ and the phases stay the same.
 > Other vendors: example configs for MiR (`agents/examples/mir_amr.json`) and
 > Universal Robots (`agents/examples/ur_arm.json`) are kept for reference.
 
-## 6. QC station, alone (MQTT only)
+## 6. QC conveyor, alone
 
-- [ ] On the scanner PC: a program that does one inspection and prints `PASS`
-      or `FAIL` (or JSON `{"pass": true, ...}`). It gets `QC_PRODUCT`,
-      `QC_STATION` and `QC_REQUEST_ID`. Put it in `.env` as `SCANNER_COMMAND`,
-      then `python3 launch.py scanner qc_01`.
-- [ ] `python3 launch.py check` shows `scanner bridge qc_01: online`.
-- [ ] `venv/bin/python robot_agent.py --config agents/qc_01_scanner.json --run quality_check quality_station`
-      with a known-good part and a known-bad part. Also unplug the camera / stop
-      the bridge: the result must be `failed`, never a pass.
+- [ ] Bring up the conveyor on its own first: the conveyor agent's README,
+      "Test procedure" 1-3 (TCP link, deploy sketch with `fake_camera.py`, MQTT).
+- [ ] In the deploy sketch you upload: `USE_MQTT = true`, `MQTT_BROKER_IP` /
+      user / password = your EMQX (same as `.env`), `MQTT_TOPIC =
+      "autonomous/product/Transformation"` (= `result_topic` in
+      `agents/qc_01_conveyor.json`). Prefer `CAMERA_TRIGGER_MODE = TRIGGER_TCP`
+      (one result per part).
+- [ ] On the central server, watch the topic while a part runs through:
+      `mosquitto_sub -h <broker> -u <user> -P <pw> -t autonomous/product/Transformation -v`.
+      Every part gives exactly one message with `"result":"OK"` or `"NG"`.
+- [ ] `venv/bin/python robot_agent.py --config agents/qc_01_conveyor.json --run quality_check quality_station`,
+      then put a part on the belt within 30 s (`lookback_s`) or while it waits:
+      expect `done` with `pass: true` for a good part and `pass: false` for a bad one.
+      With no part, it must end `failed` after `timeout_s`, never a pass.
+- [ ] Time the belt: from S1 to the verdict, and from the verdict to the part
+      stopping at S3. Put the second time plus a margin in `exit_travel_s`
+      (`agents/qc_01_conveyor.json`, default 8 s). `timeout_s` (60) must
+      comfortably cover entry-to-verdict, and `timeout_s + exit_travel_s` must
+      stay below `quality_check` in `site.json` (90).
+- [ ] Teach the arm the two belt projects (phase 5) and check them with the base
+      at `quality_station`: `--run place quality_station`, then
+      `--run pick quality_station` once the part is at S3. Also run the pick
+      with the exit empty: it must come back `failed`, not `done`.
+- [ ] Recovery: cancel a job while its part is on the belt
+      (`tools/fleetctl.py cancel <task_id>`). Expect the reply to say the part
+      may be on the conveyor, `qc_01` in `error`, and the next job waiting with
+      `conveyor of qc_01 not free`. Clear the belt, check the Opta's Serial
+      Monitor `STATUS` shows `mqtt=1 mqtt_queue=0`, run `tools/fleetctl.py reset qc_01`,
+      and the next job comes to the belt.
+
+Using a camera PC with your own program instead (`agents/qc_01_scanner.json`):
+`SCANNER_COMMAND` in `.env`, `python3 launch.py scanner qc_01`, then
+`python3 launch.py check` shows `scanner bridge qc_01: online`.
 
 ## 7. One robot, full job, supervised
 
 - [ ] Start the broker, `scheduler_service.py`, and the agents for robot_01
-      (`amr`, `arm`) and qc_01. Put every other robot in maintenance
+      (`amr`, `arm`) and qc_01 (`launch.py agents agents/qc_01_conveyor.json`). Put every other robot in maintenance
       (`tools/fleetctl.py maintenance robot_02 on`) or don't list it yet.
 - [ ] `tools/fleetctl.py status` shows robot_01 and qc_01 `idle` and healthy.
 - [ ] `tools/fleetctl.py watch` in one terminal, `manual_runner.py` in another.
       Run 20 jobs with an operator at the e-stop. Include deliberate failures:
-      remove the part before pick, block the path, unplug the QC camera, and
-      cut the robot's Wi-Fi for 10 s while it is driving.
+      remove the part before pick, block the path, unplug the QC camera (the
+      Opta faults with RESULT_TIMEOUT; the job fails with the part on the belt,
+      the empty robot is released, `qc_01` goes to `error` until you clear the
+      belt and reset it), and cut the robot's Wi-Fi for 10 s while it is
+      driving. After the Opta itself was offline during a job, expect the next
+      conveyor job to fail as `ambiguous` unless the missing verdict arrived
+      first: check those parts by hand.
 - [ ] After each induced failure, confirm the robot shows `error` with a clear
       reason. Recover the product by hand, then run `tools/fleetctl.py reset
       robot_01`.
@@ -228,7 +277,8 @@ and the phases stay the same.
 - [ ] Install the systemd units from `deploy/systemd/` (`robot-fleet-server`,
       `robot-fleet-robot@robot_01`) and enable them. Check that
       `systemctl stop robot-fleet-robot@robot_01` while it drives stops the
-      robot. On the scanner PC: `robot-fleet-scanner@qc_01`.
+      robot. The conveyor QC agent: `robot-fleet-agent@qc_01_conveyor` on the
+      central server.
 
 ## Operations cheat-sheet
 

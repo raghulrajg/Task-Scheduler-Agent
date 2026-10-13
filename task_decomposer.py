@@ -34,21 +34,39 @@ Each subtask:
     "branch": None,             # "success" | "fail" | None
     "group": "carrier",         # "carrier" | "inspector"
     "releases_robot": False,
+    "handover": None,           # "approach" / "load" / "unload" at a conveyor QC station, else None
+    "station": None,            # conveyor QC station (robot id) for approach, load and quality_check
     "attempt": 1,               # bumped by the scheduler on each retry
 }
+
+Conveyor QC stations (site.json: "conveyor" on the QC location). The part
+cannot be inspected in the gripper: the carrier places it on the belt
+("load"), the conveyor runs it past the camera and publishes the verdict,
+and the carrier picks it up again at the belt exit ("unload") before
+driving to the success/fail destination. The carrier stays claimed the
+whole time, so the robot that loaded the part is the one that unloads it.
+The quality_check goes to the conveyor's own station (conveyor.station),
+never to another QC robot in the zone, which could not see the belt. The
+drive to the conveyor ("approach") already claims the belt, so a second
+robot waits where it is instead of queuing at the belt.
 
 Validation (known locations, QC zone reachable, types) happens BEFORE this
 in validation.validate_instruction -- this module assumes clean input.
 """
 
 import uuid
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
 
 
-def decompose_pick_qc_route(instruction: Dict[str, Any]) -> List[Dict[str, Any]]:
+def decompose_pick_qc_route(instruction: Dict[str, Any],
+                            conveyor: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
     Handles: { product, source, quality_check, success_dest, fail_dest }
     Produces: navigate -> pick -> navigate -> quality_check -> (branch) ->
+              navigate -> place
+    With a conveyor at the QC location (conveyor = its site.json settings):
+              navigate -> pick -> navigate -> place (load belt) -> quality_check
+              -> [navigate to exit_location] -> pick (unload belt) -> (branch) ->
               navigate -> place
 
     navigate/pick/navigate/[navigate/place per branch] are all "carrier" --
@@ -66,7 +84,7 @@ def decompose_pick_qc_route(instruction: Dict[str, Any]) -> List[Dict[str, Any]]
     subtasks = []
 
     def add(action, target, zone, requires, manipulator=None, branch=None,
-             group="carrier", releases_robot=False, subtask_id=None):
+             group="carrier", releases_robot=False, subtask_id=None, handover=None, station=None):
         sid = subtask_id or f"{task_id}-{len(subtasks) + 1}"
         subtasks.append({
             "subtask_id": sid,
@@ -80,21 +98,33 @@ def decompose_pick_qc_route(instruction: Dict[str, Any]) -> List[Dict[str, Any]]
             "branch": branch,
             "group": group,
             "releases_robot": releases_robot,
+            "handover": handover,
+            "station": station,
             "attempt": 1,
         })
 
     add("navigate", product, source, ["navigate"])
     add("pick", product, source, ["pick"], manipulator=True)
-    add("navigate", product, qc_zone, ["navigate"])
+    station = conveyor.get("station") if conveyor is not None else None
+    add("navigate", product, qc_zone, ["navigate"], handover="approach" if conveyor is not None else None,
+        station=station)
+    if conveyor is not None:
+        add("place", product, qc_zone, ["place"], manipulator=True, handover="load", station=station)
     add("quality_check", product, qc_zone, ["quality_check"],
-        group="inspector", releases_robot=True)
+        group="inspector", releases_robot=True, station=station)
+    if conveyor is not None:
+        exit_zone = conveyor.get("exit_location") or qc_zone
+        if exit_zone != qc_zone:
+            add("navigate", product, exit_zone, ["navigate"])
+        add("pick", product, exit_zone, ["pick"], manipulator=True, handover="unload")
 
+    # both branches hang off the last common step (the QC, or the unload pick)
     qc_subtask_id = subtasks[-1]["subtask_id"]
 
     for branch, dest in (("success", success_dest), ("fail", fail_dest)):
         add("navigate", product, dest, ["navigate"], branch=branch,
             subtask_id=f"{task_id}-nav-{branch}")
-        # override depends_on: both branches hang off the QC step, not each other
+        # override depends_on: both branches hang off the common step, not each other
         subtasks[-1]["depends_on"] = qc_subtask_id
         add("place", product, dest, ["place"], manipulator=True, branch=branch,
             releases_robot=True, subtask_id=f"{task_id}-place-{branch}")
@@ -102,10 +132,12 @@ def decompose_pick_qc_route(instruction: Dict[str, Any]) -> List[Dict[str, Any]]
     return subtasks
 
 
-def decompose(instruction: Dict[str, Any]) -> List[Dict[str, Any]]:
+def decompose(instruction: Dict[str, Any], site=None) -> List[Dict[str, Any]]:
     """Dispatch to the right decomposition strategy based on instruction shape.
-    Extend this as your reasoning agent starts emitting other instruction types."""
+    Extend this as your reasoning agent starts emitting other instruction types.
+    site (validation.SiteConfig) says which QC locations are conveyors."""
     keys = set(instruction.keys())
     if {"product", "source", "quality_check", "success_dest", "fail_dest"} <= keys:
-        return decompose_pick_qc_route(instruction)
+        conveyor = site.conveyor_for(instruction["quality_check"]) if site is not None else None
+        return decompose_pick_qc_route(instruction, conveyor)
     raise ValueError(f"No decomposition strategy matches instruction keys: {keys}")

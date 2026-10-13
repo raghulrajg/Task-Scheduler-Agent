@@ -212,16 +212,19 @@ class RobotRegistry:
     # ---- claims ------------------------------------------------------------------
     def try_claim(self, required_capabilities: List[str], zone: Optional[str] = None,
                   require_manipulator: Optional[bool] = None,
-                  locations: Optional[List[str]] = None) -> Optional[Robot]:
+                  locations: Optional[List[str]] = None,
+                  robot_id: Optional[str] = None) -> Optional[Robot]:
         """Atomically find an allocatable, capable robot and mark it busy.
         locations: every place the robot will have to drive to for this job;
         robots whose base has no coordinates for one of them are skipped.
+        robot_id: only this robot may be claimed (e.g. a conveyor's own QC station).
         Among candidates, prefers the one with the most battery left.
         Returns None if nothing qualifies right now (retry later)."""
         now = self._clock()
         with self._lock:
             candidates = [r for r in self._robots.values()
-                          if self._matches(r, required_capabilities, zone, require_manipulator, now, locations)]
+                          if (robot_id is None or r.id == robot_id)
+                          and self._matches(r, required_capabilities, zone, require_manipulator, now, locations)]
             if not candidates:
                 return None
             robot = max(candidates, key=lambda r: min(

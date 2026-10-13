@@ -102,7 +102,9 @@ class Sim:
         e = event["event"]
         text = {
             "task_accepted": lambda: f"TASK {event['task_id']} accepted: {event['instruction']['product']}",
-            "subtask_queued": lambda: ("job waiting for a free robot" if event["action"] == "navigate"
+            "subtask_queued": lambda: (f"{event['action']} waiting for the conveyor ({event['reason']})"
+                                       if "conveyor" in str(event.get("reason"))
+                                       else "job waiting for a free robot" if event["action"] == "navigate"
                                        else f"{event['action']} waiting for a free station"),
             "qc_result": lambda: f"QC says {'PASS -> success_dest' if event['passed'] else 'FAIL -> fail_dest'}",
             "subtask_retry": lambda: f"retry {event['action']} (attempt {event['attempt']}): {event['reason']}",
@@ -197,7 +199,8 @@ def sc_pick_fail():
 
 
 def sc_qc_no_result():
-    """QC station answers 'done' but with no pass/fail -> NOT treated as a pass."""
+    """QC station answers 'done' but with no pass/fail -> NOT treated as a pass. The QC
+    station is flagged 'error'; the part is left on the conveyor, so the empty robot is released."""
     def policy(robot, sub, msg):
         if msg["action"] == "quality_check":
             return "done", {}
@@ -206,7 +209,9 @@ def sc_qc_no_result():
     tid = sim.sched.submit_instruction(JOB)
     sim.run()
     t = sim.sched.get_task(tid)
-    return t["state"] == "failed" and t["branch"] is None and sim.status("robot_01") == "error"
+    say(f"  qc_01 status: {sim.status('qc_01')}; robot_01 status: {sim.status('robot_01')}")
+    carrier_ok = sim.status("robot_01") == ("idle" if sim.site.conveyor_for(JOB["quality_check"]) else "error")
+    return t["state"] == "failed" and t["branch"] is None and sim.status("qc_01") == "error" and carrier_ok
 
 
 def sc_robot_silent():
