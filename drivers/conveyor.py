@@ -14,8 +14,9 @@ camera's x;y;theta;result and publishes one MQTT message per part:
 Multiple products: the camera has one program per product. For every part
 this driver publishes the part's product name on qc/<station>/request
 ({"request_id", "product", ...}); the Opta (sketch 3.1+) needs it for every
-cycle, sends "switch <product>" to the camera as soon as it arrives and
-waits 10 s for "ok" (at the latest before the part is inspected). It
+cycle, sends "switch <product>" to the camera once its entry sensor S1 has
+seen the part (never for a job cancelled before the part was on the belt)
+and waits 10 s for "ok" (at the latest before the part is inspected). It
 publishes its warnings (no "ok", no product name, ...) on
 autonomous/product/Warning; this driver logs them and forwards them to the
 operator on hmi/feedback ({"source": "conveyor", "warning", "detail", ...}).
