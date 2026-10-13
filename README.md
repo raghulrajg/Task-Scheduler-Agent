@@ -120,8 +120,16 @@ SCANNER_COMMAND=                 # scanner PC only: the program that does one in
 this repository tracked `.env`, so a plain `git pull` either deletes your
 `.env` or refuses to run. Keep a copy across the update:
 ```bash
-cp .env /tmp/env.keep && git checkout -- .env && git pull && cp /tmp/env.keep .env && chmod 600 .env && rm /tmp/env.keep
+cd /opt/robot-fleet
+sudo -u fleet cp -p .env .env.keep     # 1. keep your settings (git never touches .env.keep)
+sudo -u fleet git checkout -- .env     # 2. let git remove its old copy
+sudo -u fleet git pull                 # 3. update; if git complains about another local change, fix it and repeat 3
+sudo -u fleet cp -p .env.keep .env     # 4. put your settings back
+sudo -u fleet chmod 600 .env && sudo -u fleet rm .env.keep
 ```
+If step 3 fails, your settings are still in `.env.keep`: do step 4 before
+anything else, and never repeat step 1 in between. On Windows: `copy .env .env.keep`,
+`git checkout -- .env`, `git pull`, `copy /Y .env.keep .env`, `del .env.keep`.
 The broker password that used to be committed is public: change it in EMQX,
 in every `.env` and in the Opta sketch.
 
@@ -302,8 +310,9 @@ The Opta does not answer requests and sends no request id, so the agent takes
 the **first verdict that arrives after the robot started putting this part
 on the belt** (the scheduler sends that time as `not_before`); each verdict is
 used once. To make that safe:
-- **One part on the belt at a time.** A job's load step waits while another
-  job's part is on the belt, or while `qc_01` is not idle and healthy. The QC
+- **One job at the belt at a time.** A job's drive to the conveyor and its
+  load wait (the robot keeps its part where it is) while another job uses the
+  belt, or while `qc_01` is not idle and healthy. The QC
   step always goes to the conveyor's own station (`conveyor.station` in
   `site.json`), never to another QC robot in the zone.
 - **Wait for the exit.** The Opta publishes the verdict while the part is at
@@ -319,6 +328,9 @@ used once. To make that safe:
 - **A job that ends with its part on the belt** (QC failed, operator cancel,
   failed load or unload) puts `qc_01` in `error`, and nothing is loaded until
   a person has cleared the belt and run `tools/fleetctl.py reset qc_01`.
+  **Before the reset**, check the Opta's Serial Monitor `STATUS` shows
+  `mqtt=1 mqtt_queue=0`: the reset makes the QC agent forget verdicts it is
+  still missing, so no old verdict may still be waiting in the Opta to be sent.
 
 On the Opta (deploy sketch, see the conveyor agent's README):
 - `MQTT_BROKER_IP` / `MQTT_USERNAME` / `MQTT_PASSWORD` must be **the same EMQX as
@@ -333,8 +345,8 @@ On the Opta (deploy sketch, see the conveyor agent's README):
 The Dobot needs two more projects at the station (`agents/robot_01_arm.json`):
 `place_conveyor_entry` (put the part on the belt at S1) and `pick_conveyor_exit`
 (take it off at S3). `pick_conveyor_exit` should **wait until the part is at
-S3** before it reaches in (wire S3, or an Opta output that is on in `AT_EXIT`,
-to a Dobot DI and wait on it with a timeout), and must **check the grasp**, so
+S3** before it reaches in (wire the S3 sensor also to a Dobot DI, or add an
+output to the Opta sketch that is on in `AT_EXIT`, and wait on it with a timeout), and must **check the grasp**, so
 an empty gripper is reported as a failure (`SetOutputInt(0, 2)`), never as done.
 If the arm cannot reach the exit from the same base
 pose, add a location for it in `site.json` and `stations.json` and set
@@ -463,7 +475,7 @@ Each job becomes a small graph of subtasks:
 |---|---|---|---|---|---|
 | `T-1` | navigate | source | navigate | carrier | no |
 | `T-2` | pick | source | pick (manipulator) | carrier | no |
-| `T-3` | navigate | QC zone | navigate | carrier | no |
+| `T-3` | navigate (**approach**: waits while another job uses the belt) | QC zone | navigate | carrier | no |
 | `T-4` | place (**load** belt) | QC zone | place (manipulator) | carrier | no |
 | `T-5` | quality_check | QC zone | quality_check | inspector | **yes** |
 | (`T-6`) | navigate | `conveyor.exit_location` (only if set) | navigate | carrier | no |
@@ -502,9 +514,9 @@ When a step must be dispatched:
    `busy`, and releases the lock. Two jobs arriving at the same moment can
    never get the same robot.
 3. If nothing qualifies, the step joins a **FIFO waiting queue**, and a
-   `subtask_queued` event (with the reason) is published once. A load onto a
-   conveyor also waits here while another job's part is on the belt or the
-   conveyor's station is not idle and healthy. The queue is retried:
+   `subtask_queued` event (with the reason) is published once. The drive to a
+   conveyor and the load onto it also wait here while another job uses the
+   belt or the conveyor's station is not idle and healthy. The queue is retried:
    - after every robot result;
    - whenever a heartbeat changes whether a robot can take work (charged, e-stop released, came online, a location was taught);
    - every second by the watchdog.
@@ -787,8 +799,9 @@ Ready-made configs for other vendors are in `agents/examples/`: MiR and Universa
 | AMR: `cannot reach ONIX at ...` | the agent PC is not on the robot's network (TCP 4000/7000) |
 | QC: `no conveyor result on autonomous/product/Transformation within 60s` | is the Opta on the same broker (`MQTT_BROKER_IP` in the sketch vs `.env`), `USE_MQTT = true`, WiFi connected? Watch the topic: `mosquitto_sub -h <broker> -u <user> -P <pw> -t autonomous/product/Transformation -v` or the conveyor repo's `python/mqtt_monitor.py`. Conveyor in FAULT (Opta Serial Monitor `STATUS`)? |
 | conveyor part routed to waste with `reason: camera message was not x;y;theta;result` | the camera sent another format; check it with `SNIFF_ONLY` in the conveyor repo |
-| QC: `ambiguous conveyor verdict (...)` | a verdict may belong to another part (Opta was offline, two results for one part). Check the part by hand, clear the belt, `fleetctl reset qc_01`. Camera in continuous mode? Use `TRIGGER_TCP` |
-| job waits: `conveyor of qc_01 not free: ...` | another job's part is on the belt, or `qc_01` is in `error`/offline: after a failed or cancelled conveyor job, clear the belt and `fleetctl reset qc_01` |
+| QC: `ambiguous conveyor verdict (...)` | a verdict may belong to another part (Opta was offline, two results for one part). Check the part by hand, clear the belt, check the Opta `STATUS` shows `mqtt_queue=0`, then `fleetctl reset qc_01`. Camera in continuous mode? Use `TRIGGER_TCP` |
+| job waits: `conveyor of qc_01 not free: ...` | another job is using the belt, or `qc_01` is in `error`/offline: after a failed or cancelled conveyor job, clear the belt, check the Opta `STATUS` shows `mqtt_queue=0`, then `fleetctl reset qc_01` |
+| `reset qc_01` refused: `the conveyor of qc_01 is still in use` | a cancelled job's arm is still at the belt: wait for its robot to confirm the cancel, then clear the belt |
 | arm: `no Dobot project configured for place at 'quality_station'` | add `place_conveyor_entry` / `pick_conveyor_exit` to `agents/robot_01_arm.json` (6.3) |
 | QC: `no result from the scanner ... (no scanner heartbeat)` | start `launch.py scanner qc_01` on the scanner PC; check `--test` matches |
 | QC: `scanner error: ...` | the inspection program failed or printed something other than PASS/FAIL/JSON |

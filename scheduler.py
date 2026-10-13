@@ -44,8 +44,9 @@ What it guarantees, and why each part exists on a real shop floor:
    verdict, and the carrier picks the part up at the belt exit. The QC
    dispatch carries "not_before" = when the load step was dispatched, so the
    station only accepts a conveyor result produced after this part was
-   handed over. ONE part is on a belt at a time: a load waits while another
-   job's part is on it or the station is not idle and healthy. A job that
+   handed over. ONE job uses a belt at a time: its drive to the conveyor
+   ("approach") and its load wait while another job holds the belt or the
+   station is not idle and healthy. A job that
    ends (failed/cancelled) with its part possibly on the belt puts the
    station in 'error', so nothing is loaded until a human has cleared the
    belt and sent reset_robot for the station.
@@ -101,6 +102,13 @@ class TaskScheduler:
                          or not station.can_operate_in(loc)):
                 raise ValueError(f"site.json locations.{loc}.conveyor.station {conv['station']!r} must be a robot "
                                  f"in robots_metadata.json with quality_check in zone {loc!r}")
+            served = {x for x in site.locations if (site.conveyor_for(x) or {}).get("station") == conv["station"]} \
+                if conv else set()
+            if conv and not set(station.zones) <= served:
+                # its 'error' (part left on the belt) must not be cleared by QC work elsewhere
+                raise ValueError(f"conveyor QC station {conv['station']!r} may only work at its conveyor "
+                                 f"location(s) {sorted(served)}; its zones in robots_metadata.json are "
+                                 f"{station.zones}")
 
         if state_path:
             self._load_state()
@@ -296,7 +304,7 @@ class TaskScheduler:
             return False
         sub = task["subtasks"][sid]
 
-        if sub.get("handover") == "load":
+        if sub.get("handover") in ("approach", "load"):
             blocker = self._conveyor_blocker(task, sub)
             if blocker:
                 self._queue(task_id, sid, sub, from_queue, f"conveyor of {sub.get('station')} not free: {blocker}")
@@ -349,24 +357,33 @@ class TaskScheduler:
                 logger.info("%s -- queued", reason)
                 self._event("subtask_queued", task_id, subtask_id=sid, action=sub["action"], reason=reason)
 
-    def _part_on_belt(self, task) -> Optional[str]:
-        """The conveyor QC station whose belt may hold this task's part: from
-        the moment the load step was dispatched until the unload pick is done."""
+    def _belt_station(self, task, since=("load",)) -> Optional[str]:
+        """The conveyor QC station of this task, if one of its `since` steps has
+        been dispatched and its unload pick is not done yet."""
         subs = task["subtasks"].values()
-        load = next((s for s in subs if s.get("handover") == "load"), None)
-        if load is None or load.get("dispatched_at") is None:
+        first = next((s for s in subs if s.get("handover") in since and s.get("dispatched_at") is not None), None)
+        if first is None:
             return None
         unload = next((s for s in subs if s.get("handover") == "unload"), None)
         if unload is not None and unload["subtask_id"] in task["completed"]:
             return None
-        return load.get("station")
+        return first.get("station")
+
+    def _part_on_belt(self, task) -> Optional[str]:
+        """The conveyor QC station whose belt may hold this task's part: from
+        the moment the load step was dispatched until the unload pick is done."""
+        return self._belt_station(task, ("load",))
+
+    def _belt_claimed(self, task) -> Optional[str]:
+        """The conveyor this task is using: from its drive there until the unload pick is done."""
+        return self._belt_station(task, ("approach", "load"))
 
     def _conveyor_blocker(self, task, sub) -> Optional[str]:
-        """Why this load step may not put a part on the belt now, or None."""
+        """Why this approach/load step may not go to the belt now, or None."""
         station_id = sub.get("station")
         for other in self._tasks.values():
-            if other is not task and other["state"] == "active" and self._part_on_belt(other) == station_id:
-                return f"task {other['task_id']} has a part on it"
+            if other is not task and other["state"] == "active" and self._belt_claimed(other) == station_id:
+                return f"task {other['task_id']} is using it"
         station = self.registry.get(station_id) if station_id else None
         if station is None:
             return f"unknown QC station {station_id!r}"
@@ -561,6 +578,13 @@ class TaskScheduler:
                    if t["state"] == "active" and t["carrier_robot"] == robot_id]
         if holders:
             return {"ok": False, "message": f"{robot_id} is the carrier of active task(s) {holders}; cancel first"}
+        at_belt = sorted({inf["task_id"] for inf in self._in_flight.values()
+                          if self._belt_claimed(self._tasks[inf["task_id"]]) == robot_id}
+                         | {t["task_id"] for t in self._tasks.values()
+                            if t["state"] == "active" and self._part_on_belt(t) == robot_id})
+        if at_belt:
+            return {"ok": False, "message": f"the conveyor of {robot_id} is still in use by task(s) {at_belt}: "
+                                            f"wait until their robots have confirmed, then clear the belt"}
         self.registry.mark_idle(robot_id)
         self._dirty = True
         self._event("robot_reset", None, robot_id=robot_id)
@@ -646,6 +670,13 @@ class TaskScheduler:
         self._sub_index = {sid: tid for tid, t in self._tasks.items() for sid in t["subtasks"]}
         self._pending = [tuple(p) for p in data.get("pending", [])]
         self._in_flight = data.get("in_flight", {})
+        for t in self._tasks.values():          # tasks saved before conveyor steps named their station
+            for s in t["subtasks"].values():
+                prev = t["subtasks"].get(s["depends_on"]) if s.get("depends_on") else None
+                belt_step = s.get("handover") in ("approach", "load") or (
+                    s["action"] == "quality_check" and prev is not None and prev.get("handover") == "load")
+                if belt_step and not s.get("station"):
+                    s["station"] = (self.site.conveyor_for(s["zone"]) or {}).get("station")
         self.registry.restore_statuses(data.get("robots", {}))
         # Give robots time to reconnect and re-send results before the
         # watchdog starts expiring what was in flight while we were down.

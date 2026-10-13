@@ -14,5 +14,6 @@ env/
 
 # Secrets and runtime state -- never commit
 .env
+.env.keep
 state/
 *.lock

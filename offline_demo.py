@@ -102,7 +102,9 @@ class Sim:
         e = event["event"]
         text = {
             "task_accepted": lambda: f"TASK {event['task_id']} accepted: {event['instruction']['product']}",
-            "subtask_queued": lambda: ("job waiting for a free robot" if event["action"] == "navigate"
+            "subtask_queued": lambda: (f"{event['action']} waiting for the conveyor ({event['reason']})"
+                                       if "conveyor" in str(event.get("reason"))
+                                       else "job waiting for a free robot" if event["action"] == "navigate"
                                        else f"{event['action']} waiting for a free station"),
             "qc_result": lambda: f"QC says {'PASS -> success_dest' if event['passed'] else 'FAIL -> fail_dest'}",
             "subtask_retry": lambda: f"retry {event['action']} (attempt {event['attempt']}): {event['reason']}",

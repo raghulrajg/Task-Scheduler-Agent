@@ -44,6 +44,9 @@ Fail-safe rules:
   * if the Opta adds "age_ms" (time since the inspection) to its message,
     results are matched by inspection time instead of arrival time, so a
     verdict flushed late from its offline queue is never taken for a new part.
+  * an operator's reset_robot for this station (scheduler/events
+    "robot_reset", sent after a person cleared the belt and checked that the
+    Opta's send queue is empty) forgets missing and buffered verdicts.
 
 Config (agents/qc_01_conveyor.json):
 {
@@ -92,6 +95,8 @@ class ConveyorInspectionDriver(Driver):
         import config
         from mqtt_common import connected_ok, guarded, make_client, start
         self.station = cfg.get("station") or cfg.get("_robot_id") or "qc_01"
+        self.robot_id = cfg.get("_robot_id") or self.station
+        self.event_topic = config.topic(config.EVENT_TOPIC)
         raw_topic = cfg.get("result_topic") or DEFAULT_TOPIC
         self.result_topic = config.topic(raw_topic) if cfg.get("namespaced", True) else raw_topic
         self.request_topic = config.topic(f"qc/{self.station}/request") if cfg.get("announce", True) else None
@@ -128,13 +133,22 @@ class ConveyorInspectionDriver(Driver):
             logger.error("conveyor link: MQTT connect refused: %s", reason_code)
             return
         self.connected = True
-        client.subscribe(self.result_topic, qos=1)
+        client.subscribe([(self.result_topic, 1), (self.event_topic, 1)])
         logger.info("listening for conveyor results on %s", self.result_topic)
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):
         self.connected = False
 
     def _on_message(self, client, userdata, msg):
+        if msg.topic == self.event_topic:
+            try:
+                event = json.loads(msg.payload.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                return
+            if isinstance(event, dict) and event.get("event") == "robot_reset" \
+                    and event.get("robot_id") == self.robot_id:
+                self.reset()
+            return
         if msg.retain:
             logger.info("ignoring retained (old) message on %s", msg.topic)
             return
@@ -170,6 +184,18 @@ class ConveyorInspectionDriver(Driver):
             self._cond.notify_all()
         logger.info("conveyor result #%d: %s", entry["seq"], payload)
         return True
+
+    def reset(self) -> None:
+        """The operator cleared the belt and reset the station: forget verdicts
+        still owed or buffered, so the next part starts clean."""
+        with self._cond:
+            for r in self._results:
+                r["used"] = True
+            dropped = list(self._owed)
+            self._owed.clear()
+            self._ambiguous.clear()
+        logger.warning("station reset by the operator: buffered results discarded%s",
+                       f", missing verdicts for {dropped} forgotten" if dropped else "")
 
     def _take(self, since: float) -> Optional[Dict[str, Any]]:
         """First unused result inspected at or after `since` (self._cond held)."""
@@ -267,6 +293,9 @@ class ConveyorInspectionDriver(Driver):
                 if self._unused_since(since):
                     return self._ambiguous_result(sid, since, "more than one conveyor result for one part")
             if cancel.is_set():
+                with self._cond:               # a retry of this part may still use the verdict
+                    entry["used"] = False
+                    self._cond.notify_all()
                 return cancelled()
             remaining = ready_at - self._clock()
             if remaining <= 0:

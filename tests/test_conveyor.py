@@ -151,6 +151,33 @@ def test_cancel_during_exit_travel(conveyor):
     assert time.time() - t0 < 2
 
 
+def test_retry_after_a_cancel_during_exit_travel_still_gets_the_verdict(conveyor):
+    drv = conveyor(exit_travel_s=0.6, timeout_s=2)
+    cancel = threading.Event()
+    t0 = time.time()
+    drv.add_result(OPTA_NG)
+    threading.Timer(0.2, cancel.set).start()
+    assert inspect(drv, not_before=t0, cancel=cancel)["state"] == "cancelled"
+    res = inspect(drv, not_before=t0)                                          # the scheduler's retry
+    assert res["state"] == "done" and res["result"]["pass"] is False
+
+
+def test_operator_reset_forgets_missing_and_buffered_verdicts(conveyor):
+    class Msg:
+        def __init__(self, payload):
+            self.topic, self.payload, self.retain = config.topic("scheduler/events"), payload, False
+    drv = conveyor(timeout_s=0.3, clock_skew_s=0)
+    assert inspect(drv, not_before=time.time(), sid="A-5")["state"] == "failed"   # verdict never came
+    drv._on_message(None, None, Msg(json.dumps({"event": "robot_reset", "robot_id": "qc_02"}).encode()))
+    assert "verdict still missing" in drv.get_state()["detail"]                    # someone else's reset
+    drv._on_message(None, None, Msg(json.dumps({"event": "robot_reset", "robot_id": "qc_01"}).encode()))
+    assert "verdict still missing" not in drv.get_state()["detail"]
+    tb = time.time()
+    drv.add_result(OPTA_OK, t=tb + 0.1)
+    res = inspect(drv, not_before=tb, sid="B-5")
+    assert res["state"] == "done" and res["result"]["pass"] is True
+
+
 def test_stale_verdict_after_a_missed_one_fails_closed(conveyor):
     """The Opta was offline: part A's verdict never came, and A's QC timed out.
     When it comes back, its queue flushes A's verdict after B was loaded:
@@ -290,7 +317,7 @@ def test_conveyor_decomposition_order(conveyor_site):
     subs = decompose(INSTRUCTION, conveyor_site)
     common = [(s["action"], s["zone"], s.get("handover")) for s in subs if s["branch"] is None]
     assert common == [("navigate", "manufacturing_1", None), ("pick", "manufacturing_1", None),
-                      ("navigate", "quality_station", None), ("place", "quality_station", "load"),
+                      ("navigate", "quality_station", "approach"), ("place", "quality_station", "load"),
                       ("quality_check", "quality_station", None), ("pick", "quality_station", "unload")]
     unload = subs[5]["subtask_id"]
     assert {s["depends_on"] for s in subs if s["action"] == "navigate" and s["branch"]} == {unload}
@@ -375,13 +402,13 @@ def test_cancel_during_conveyor_qc_frees_carrier_and_blocks_the_belt(conveyor_si
     sched.on_robot_status(qc_robot, qc_sub, {"subtask_id": qc["subtask_id"], "attempt": qc["attempt"],
                                              "state": "cancelled"})
     assert registry.get("qc_01").status == "error", "the part is still on the belt"
-    # the next job may not load the belt until a human cleared it and reset the station
+    # the next job may not even drive to the belt until a human cleared it and reset the station
     tid2 = sched.submit_instruction({**INSTRUCTION, "product": "NEXT"})
-    for _ in range(3):
-        ack(sched, mqtt)
-    assert mqtt.tasks[-1][2]["action"] == "navigate" and (tid2, f"{tid2}-4") in sched.pending()
+    ack(sched, mqtt)
+    ack(sched, mqtt)
+    assert mqtt.tasks[-1][2]["action"] == "pick" and (tid2, f"{tid2}-3") in sched.pending()
     assert sched.handle_command({"cmd": "reset_robot", "robot_id": "qc_01"})["ok"]
-    assert mqtt.tasks[-1][2]["handover"] == "load" and mqtt.tasks[-1][2]["task_id"] == tid2
+    assert mqtt.tasks[-1][2]["handover"] == "approach" and mqtt.tasks[-1][2]["task_id"] == tid2
 
 
 def test_failed_load_onto_belt_flags_robot_and_station(conveyor_site, registry, clock):
@@ -405,20 +432,24 @@ def test_one_part_on_the_belt_at_a_time_and_qc_only_on_the_conveyor_station(conv
         r, s, m = [x for x in mqtt.tasks if x[2]["task_id"] == task_id][-1]
         sched.on_robot_status(r, s, {"subtask_id": m["subtask_id"], "attempt": m["attempt"], "state": "done", **kw})
         return [x for x in mqtt.tasks if x[2]["task_id"] == task_id][-1]
-    for _ in range(3):                                            # both robots drive to the QC location
+    for _ in range(2):                                            # both robots pick up their part
         step(t1)
         step(t2)
     actions = {tid: [m["action"] for _, _, m in mqtt.tasks if m["task_id"] == tid] for tid in (t1, t2)}
-    assert actions[t1][-1] == "place" and actions[t2][-1] == "navigate"
-    assert (t2, f"{t2}-4") in sched.pending(), "P2 waits until P1 is off the belt"
+    assert actions[t1][-1] == "navigate" and actions[t2][-1] == "pick"
+    assert (t2, f"{t2}-3") in sched.pending(), "robot 2 waits with its part until P1 is off the belt"
     queued = [e for e in mqtt.events if e["event"] == "subtask_queued" and e["task_id"] == t2]
-    assert queued and "has a part on it" in queued[0]["reason"]
+    assert queued and "is using it" in queued[0]["reason"]
+    step(t1)                                                      # robot 1 at the belt -> load
     step(t1)                                                      # P1 on the belt -> QC on qc_01
     r, _, m = [x for x in mqtt.tasks if x[2]["task_id"] == t1][-1]
     assert (r, m["action"]) == ("qc_01", "quality_check")
     step(t1, result={"pass": True})                               # verdict -> unload pick
-    assert (t2, f"{t2}-4") in sched.pending()
-    step(t1)                                                      # P1 off the belt -> P2 may load
+    assert (t2, f"{t2}-3") in sched.pending()
+    step(t1)                                                      # P1 off the belt -> robot 2 may come
+    r, _, m = [x for x in mqtt.tasks if x[2]["task_id"] == t2][-1]
+    assert m["handover"] == "approach"
+    step(t2)
     r, _, m = [x for x in mqtt.tasks if x[2]["task_id"] == t2][-1]
     assert m["handover"] == "load"
     step(t2)
@@ -431,11 +462,11 @@ def test_belt_is_not_loaded_while_its_station_is_down(conveyor_site, registry, c
     registry.update_health("qc_01", "scanner", {"online": False}, now=clock())
     sched, mqtt = make(conveyor_site, registry, clock)
     tid = sched.submit_instruction(INSTRUCTION)
-    for _ in range(3):
-        ack(sched, mqtt)
-    assert (tid, f"{tid}-4") in sched.pending()
+    ack(sched, mqtt)
+    ack(sched, mqtt)
+    assert (tid, f"{tid}-3") in sched.pending()
     sched.on_robot_heartbeat("qc_01", "scanner", {"online": True, "ready": True})
-    assert mqtt.tasks[-1][2]["handover"] == "load"
+    assert mqtt.tasks[-1][2]["handover"] == "approach"
 
 
 def test_conveyor_station_must_exist_and_serve_the_location(registry, clock):
@@ -444,6 +475,44 @@ def test_conveyor_station_must_exist_and_serve_the_location(registry, clock):
         data["locations"]["quality_station"]["conveyor"]["station"] = station
         with pytest.raises(ValueError, match="conveyor.station"):
             TaskScheduler(registry, FakeMQTT(), SiteConfig.from_dict(data), clock=clock)
+
+
+def test_conveyor_station_may_not_work_elsewhere(conveyor_site, registry, clock):
+    """Its 'error' (part left on the belt) must not be cleared by QC work at another location."""
+    registry.get("qc_01").zones = ["*"]
+    with pytest.raises(ValueError, match="may only work at its conveyor"):
+        TaskScheduler(registry, FakeMQTT(), conveyor_site, clock=clock)
+
+
+def test_reset_refused_while_the_belt_is_still_in_use(conveyor_site, registry, clock):
+    sched, mqtt = make(conveyor_site, registry, clock)
+    tid = sched.submit_instruction(INSTRUCTION)
+    run_to_conveyor_qc(sched, mqtt)
+    ack(sched, mqtt, result={"pass": True})
+    robot, sub_, unload = mqtt.tasks[-1]
+    assert unload["handover"] == "unload"
+    sched.handle_command({"cmd": "cancel_task", "task_id": tid})       # arm still reaching into the exit
+    assert registry.get("qc_01").status == "error"
+    res = sched.handle_command({"cmd": "reset_robot", "robot_id": "qc_01"})
+    assert not res["ok"] and "still in use" in res["message"]
+    sched.on_robot_status(robot, sub_, {"subtask_id": unload["subtask_id"], "attempt": unload["attempt"],
+                                        "state": "cancelled"})
+    assert sched.handle_command({"cmd": "reset_robot", "robot_id": "qc_01"})["ok"]
+
+
+def test_state_saved_before_belt_steps_named_their_station_is_upgraded(conveyor_site, clock, tmp_path):
+    path = str(tmp_path / "state.json")
+    s1 = TaskScheduler(healthy_registry(clock), FakeMQTT(), conveyor_site, state_path=path, clock=clock)
+    tid = s1.submit_instruction(INSTRUCTION)
+    data = json.load(open(path))
+    for s in data["tasks"][tid]["subtasks"].values():
+        s.pop("station", None)
+        if s.get("handover") == "approach":
+            s["handover"] = None                         # 3312921 had no approach step
+    json.dump(data, open(path, "w"))
+    s2 = TaskScheduler(healthy_registry(clock), FakeMQTT(), conveyor_site, state_path=path, clock=clock)
+    subs = s2.get_task(tid)["subtasks"]
+    assert subs[f"{tid}-4"]["station"] == "qc_01" and subs[f"{tid}-5"]["station"] == "qc_01"
 
 
 def exit_site():

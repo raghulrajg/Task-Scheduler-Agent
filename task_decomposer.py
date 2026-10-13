@@ -34,8 +34,8 @@ Each subtask:
     "branch": None,             # "success" | "fail" | None
     "group": "carrier",         # "carrier" | "inspector"
     "releases_robot": False,
-    "handover": None,           # "load" / "unload" at a conveyor QC station, else None
-    "station": None,            # conveyor QC station (robot id) for load + quality_check steps
+    "handover": None,           # "approach" / "load" / "unload" at a conveyor QC station, else None
+    "station": None,            # conveyor QC station (robot id) for approach, load and quality_check
     "attempt": 1,               # bumped by the scheduler on each retry
 }
 
@@ -46,7 +46,9 @@ and the carrier picks it up again at the belt exit ("unload") before
 driving to the success/fail destination. The carrier stays claimed the
 whole time, so the robot that loaded the part is the one that unloads it.
 The quality_check goes to the conveyor's own station (conveyor.station),
-never to another QC robot in the zone, which could not see the belt.
+never to another QC robot in the zone, which could not see the belt. The
+drive to the conveyor ("approach") already claims the belt, so a second
+robot waits where it is instead of queuing at the belt.
 
 Validation (known locations, QC zone reachable, types) happens BEFORE this
 in validation.validate_instruction -- this module assumes clean input.
@@ -103,8 +105,9 @@ def decompose_pick_qc_route(instruction: Dict[str, Any],
 
     add("navigate", product, source, ["navigate"])
     add("pick", product, source, ["pick"], manipulator=True)
-    add("navigate", product, qc_zone, ["navigate"])
     station = conveyor.get("station") if conveyor is not None else None
+    add("navigate", product, qc_zone, ["navigate"], handover="approach" if conveyor is not None else None,
+        station=station)
     if conveyor is not None:
         add("place", product, qc_zone, ["place"], manipulator=True, handover="load", station=station)
     add("quality_check", product, qc_zone, ["quality_check"],

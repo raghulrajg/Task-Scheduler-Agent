@@ -63,8 +63,9 @@ and the phases stay the same.
       sudo -u fleet venv/bin/python launch.py check                        # preflight
       ```
       **Already installed from an older version** (when `.env` was still in git)?
-      Update without losing `.env`:
-      `cp .env /tmp/env.keep && git checkout -- .env && git pull && cp /tmp/env.keep .env && chmod 600 .env && rm /tmp/env.keep`
+      Update without losing `.env`: follow "Updating an install made before
+      `.env` was untracked" in README section 3.1 (copy `.env` to `.env.keep`,
+      `git checkout -- .env`, `git pull`, copy it back).
 
 ## 2. Simulated end-to-end (no hardware)
 
@@ -146,8 +147,8 @@ and the phases stay the same.
    `pick_manufacturing_1`, `place_conveyor_entry` (part onto the belt at S1),
    `pick_conveyor_exit` (part off the belt at S3), `place_package_area`,
    `place_waste_area`. `pick_conveyor_exit` must **wait until the part is at
-   S3** before reaching in: wire S3 (or an Opta output that is on in
-   `AT_EXIT`) to a Dobot DI, wait on it with a timeout, and report failure
+   S3** before reaching in: wire the S3 sensor also to a Dobot DI (or add an
+   output to the Opta sketch that is on in `AT_EXIT`), wait on it with a timeout, and report failure
    (`SetOutputInt(0, 2)`) if it never comes. The agent already holds the
    verdict back by `exit_travel_s`, but the DI is what makes it safe against
    a slow or jammed belt.
@@ -232,8 +233,9 @@ and the phases stay the same.
 - [ ] Recovery: cancel a job while its part is on the belt
       (`tools/fleetctl.py cancel <task_id>`). Expect the reply to say the part
       may be on the conveyor, `qc_01` in `error`, and the next job waiting with
-      `conveyor of qc_01 not free`. Clear the belt, `tools/fleetctl.py reset qc_01`,
-      and the next job loads.
+      `conveyor of qc_01 not free`. Clear the belt, check the Opta's Serial
+      Monitor `STATUS` shows `mqtt=1 mqtt_queue=0`, run `tools/fleetctl.py reset qc_01`,
+      and the next job comes to the belt.
 
 Using a camera PC with your own program instead (`agents/qc_01_scanner.json`):
 `SCANNER_COMMAND` in `.env`, `python3 launch.py scanner qc_01`, then
