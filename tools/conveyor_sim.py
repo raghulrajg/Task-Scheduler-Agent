@@ -7,11 +7,13 @@ conveyor_inspection driver (agents/qc_01_conveyor.json) can be tested
 end to end without the belt:
 
     sim/autonomous/product/Transformation
-    {"x":12.500,"y":30.200,"theta":45.000,"result":"OK","valid":true,"cycle":5,"raw":"12.5;30.2;45.0;OK;"}
+    {"x":12.500,"y":30.200,"theta":45.000,"result":"OK","valid":true,"cycle":5,"raw":"12.5;30.2;45.0;OK;",
+     "product":"ABCD","switch_ok":true}
 
 By default it answers every inspection the driver announces on
 qc/<station>/request after --delay seconds (the time the part needs to reach
-the camera). Typed commands work as well:
+the camera), with the product name from the request (like the Opta, which
+switches the camera to that product's program). Typed commands work as well:
     Enter / ok      publish an OK result        ng          publish an NG result
     raw <text>      publish an invalid camera message (valid=false, NG)
 
@@ -41,15 +43,16 @@ import config  # noqa: E402
 from mqtt_common import connected_ok, guarded, make_client, start, stop  # noqa: E402
 
 
-def opta_payload(cycle: int, ok: bool, valid: bool = True, raw: str = "") -> dict:
+def opta_payload(cycle: int, ok: bool, valid: bool = True, raw: str = "", product=None) -> dict:
     """The JSON the Opta publishes (see publishResult() in the conveyor_agent sketch)."""
+    switch = {"product": product, "switch_ok": True if product else None}
     if not valid:
         return {"x": None, "y": None, "theta": None, "result": "NG", "valid": False, "cycle": cycle,
-                "raw": raw or "garbage"}
+                "raw": raw or "garbage", **switch}
     x, y, theta = round(random.uniform(0, 50), 3), round(random.uniform(0, 50), 3), round(random.uniform(-180, 180), 3)
     verdict = "OK" if ok else "NG"
     return {"x": x, "y": y, "theta": theta, "result": verdict, "valid": True, "cycle": cycle,
-            "raw": f"{x};{y};{theta};{verdict};"}
+            "raw": f"{x};{y};{theta};{verdict};", **switch}
 
 
 def main():
@@ -73,16 +76,16 @@ def main():
     lock = threading.Lock()
     state = {"cycle": 0}
 
-    def publish(ok: bool, valid: bool = True, raw: str = ""):
+    def publish(ok: bool, valid: bool = True, raw: str = "", product=None):
         with lock:
             state["cycle"] += 1
-            payload = opta_payload(state["cycle"], ok, valid, raw)
+            payload = opta_payload(state["cycle"], ok, valid, raw, product)
         client.publish(result_topic, json.dumps(payload), qos=0)
         print(f"{time.strftime('%H:%M:%S')} published {payload}", flush=True)
 
     def answer(request):
         time.sleep(args.delay)
-        publish(random.random() < args.pass_rate)
+        publish(random.random() < args.pass_rate, product=request.get("product"))
 
     def on_connect(c, u, flags, rc, props):
         if connected_ok(rc) and not args.manual:

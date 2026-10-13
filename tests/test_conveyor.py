@@ -74,6 +74,55 @@ def test_invalid_message_can_be_a_failed_inspection_instead(conveyor):
     assert res["state"] == "failed" and "invalid camera message" in res["error"]
 
 
+# ---- multiple products (Opta sketch 3.1: "switch <product>" before each inspection)
+def test_result_for_this_product_passes_with_switch_details(conveyor):
+    drv = conveyor()
+    t0 = time.time()
+    drv.add_result(dict(OPTA_OK, product="ABCD", switch_ok=True))
+    res = inspect(drv, not_before=t0)
+    assert res["state"] == "done" and res["result"]["pass"] is True
+    d = res["result"]["details"]
+    assert d["product"] == "ABCD" and d["switch_ok"] is True and "warning" not in d
+
+
+def test_unconfirmed_program_switch_is_a_warning_not_a_failure(conveyor):
+    drv = conveyor()
+    t0 = time.time()
+    drv.add_result(dict(OPTA_NG, product="ABCD", switch_ok=False))
+    res = inspect(drv, not_before=t0)
+    assert res["state"] == "done" and res["result"]["pass"] is False
+    assert "did not confirm" in res["result"]["details"]["warning"]
+
+
+def test_result_for_another_product_is_never_routed(conveyor):
+    drv = conveyor(timeout_s=0.5)
+    t0 = time.time()
+    drv.add_result(dict(OPTA_OK, product="WXYZ", switch_ok=True))
+    res = inspect(drv, not_before=t0)                       # this part is ABCD
+    assert res["state"] == "failed" and "'WXYZ'" in res["error"] and "'ABCD'" in res["error"]
+    retry = inspect(drv, not_before=t0)                     # a retry does not wait for another verdict
+    assert retry["state"] == "failed"
+
+
+def test_opta_warnings_are_forwarded_to_the_operator(conveyor):
+    drv = conveyor()
+    sent = []
+    drv._client.publish = lambda topic, payload, qos=0: sent.append((topic, json.loads(payload)))
+
+    class Msg:
+        topic = drv.warning_topic
+        retain = False
+        payload = json.dumps({"warning": "SWITCH_NO_ACK", "product": "ABCD", "cycle": 3,
+                              "state": "SWITCH_PROGRAM", "detail": "no 'ok' within 10 s"}).encode()
+    drv._on_message(None, None, Msg())
+    assert sent == [(config.topic(config.HMI_FEEDBACK_TOPIC),
+                     {**sent[0][1], "source": "conveyor", "station": "qc_01", "warning": "SWITCH_NO_ACK",
+                      "product": "ABCD", "ok": False})]
+    assert "SWITCH_NO_ACK" in drv.get_state()["detail"]
+    with drv._cond:
+        assert not drv._results                              # a warning is not a result
+
+
 @pytest.mark.parametrize("bad", [{**OPTA_OK, "result": "ok"}, {**OPTA_OK, "result": "MAYBE"},
                                  {k: v for k, v in OPTA_OK.items() if k != "result"}])
 def test_unrecognised_verdict_is_never_a_pass(conveyor, bad):
@@ -616,6 +665,8 @@ def test_conveyor_agent_config_matches_the_opta_sketch():
     drv = cfg["driver"]
     assert drv["result_topic"] == "autonomous/product/Transformation"     # MQTT_TOPIC in the sketch
     assert drv["pass_values"] == ["OK"] and drv["fail_values"] == ["NG"]  # the only values publishResult() sends
+    assert drv["announce"] is True                                         # the Opta takes the product name from it
+    assert drv["warning_topic"] == "autonomous/product/Warning"           # MQTT_WARNING_TOPIC in the sketch
 
 
 # ============================================================== over a real broker
