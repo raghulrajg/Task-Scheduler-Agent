@@ -300,8 +300,9 @@ publishes the camera verdict for every part on `autonomous/product/Transformatio
 **Multiple products.** The camera has one program per product. For every part
 the QC agent publishes the part's product name (the one in the operator's
 message, e.g. "take **ABCD** from manufacturing_1 ...") on `qc/qc_01/request`.
-The Opta needs it for **every** cycle: when the part has stopped at the camera
-it sends `switch ABCD` to the camera over TCP and waits 10 s for `ok`. Without
+The Opta needs it for **every** cycle: as soon as the name arrives it sends
+`switch ABCD` to the camera over TCP and waits 10 s for `ok`, so the program
+is normally loaded before the part reaches the camera. Without
 `ok` it warns and carries on (`"switch_ok": false`); without a product name
 for 30 s it faults (`NO_PRODUCT`). The Opta's warnings
 (`autonomous/product/Warning`) are logged by the QC agent and forwarded to the
