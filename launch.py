@@ -70,8 +70,10 @@ class Child:
         kwargs = {}
         if os.name == "nt":
             kwargs["creationflags"] = 0  # same console: Ctrl+C reaches the children too
-        self.proc = subprocess.Popen(self.argv, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, bufsize=1, **kwargs)
+        # stdin=DEVNULL: no child reads the keyboard (a key pressed in the launcher
+        # window must never reach e.g. the conveyor simulator's typed commands)
+        self.proc = subprocess.Popen(self.argv, env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1, **kwargs)
         self.started_at = time.time()
         threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
 

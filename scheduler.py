@@ -40,10 +40,15 @@ What it guarantees, and why each part exists on a real shop floor:
    a silent pass.
 
    Conveyor QC stations (site.json "conveyor"): the carrier places the part
-   on the belt, the station reports the conveyor's verdict, and the carrier
-   picks the part up at the belt exit. The QC dispatch carries "not_before"
-   = when the load step was dispatched, so the station only accepts a
-   conveyor result produced after this part was handed over.
+   on the belt, the conveyor's own station (conveyor.station) reports the
+   verdict, and the carrier picks the part up at the belt exit. The QC
+   dispatch carries "not_before" = when the load step was dispatched, so the
+   station only accepts a conveyor result produced after this part was
+   handed over. ONE part is on a belt at a time: a load waits while another
+   job's part is on it or the station is not idle and healthy. A job that
+   ends (failed/cancelled) with its part possibly on the belt puts the
+   station in 'error', so nothing is loaded until a human has cleared the
+   belt and sent reset_robot for the station.
 
 7. PERSISTENCE. All task/robot state is written to disk after every change
    and restored on start, so a scheduler restart doesn't forget that a robot
@@ -88,6 +93,14 @@ class TaskScheduler:
         self._in_flight: Dict[str, Dict[str, Any]] = {}  # subtask_id -> dispatch record
         self._pending: List[Tuple[str, str]] = []        # FIFO of (task_id, subtask_id)
         self._dirty = False
+
+        for loc in site.locations:
+            conv = site.conveyor_for(loc)
+            station = registry.get(conv["station"]) if conv else None
+            if conv and (station is None or not station.has_capability("quality_check")
+                         or not station.can_operate_in(loc)):
+                raise ValueError(f"site.json locations.{loc}.conveyor.station {conv['station']!r} must be a robot "
+                                 f"in robots_metadata.json with quality_check in zone {loc!r}")
 
         if state_path:
             self._load_state()
@@ -283,6 +296,12 @@ class TaskScheduler:
             return False
         sub = task["subtasks"][sid]
 
+        if sub.get("handover") == "load":
+            blocker = self._conveyor_blocker(task, sub)
+            if blocker:
+                self._queue(task_id, sid, sub, from_queue, f"conveyor of {sub.get('station')} not free: {blocker}")
+                return False
+
         if sub["group"] == "carrier" and task["carrier_robot"]:
             robot = self.registry.get(task["carrier_robot"])
             if robot is None:
@@ -297,11 +316,7 @@ class TaskScheduler:
             try:
                 robot = self.allocator.allocate(sub, locations=places)
             except AllocationError as e:
-                if (task_id, sid) not in self._pending:
-                    self._pending.append((task_id, sid))
-                    if not from_queue:  # announce once, not on every retry pass
-                        logger.info("%s -- queued", e)
-                        self._event("subtask_queued", task_id, subtask_id=sid, action=sub["action"])
+                self._queue(task_id, sid, sub, from_queue, str(e))
                 return False
             if sub["group"] == "carrier":
                 task["carrier_robot"] = robot.id
@@ -326,6 +341,39 @@ class TaskScheduler:
         self._event("subtask_dispatched", task_id, subtask_id=sid, action=sub["action"],
                     zone=sub["zone"], robot_id=robot.id, attempt=sub["attempt"])
         return True
+
+    def _queue(self, task_id: str, sid: str, sub, from_queue: bool, reason: str):
+        if (task_id, sid) not in self._pending:
+            self._pending.append((task_id, sid))
+            if not from_queue:  # announce once, not on every retry pass
+                logger.info("%s -- queued", reason)
+                self._event("subtask_queued", task_id, subtask_id=sid, action=sub["action"], reason=reason)
+
+    def _part_on_belt(self, task) -> Optional[str]:
+        """The conveyor QC station whose belt may hold this task's part: from
+        the moment the load step was dispatched until the unload pick is done."""
+        subs = task["subtasks"].values()
+        load = next((s for s in subs if s.get("handover") == "load"), None)
+        if load is None or load.get("dispatched_at") is None:
+            return None
+        unload = next((s for s in subs if s.get("handover") == "unload"), None)
+        if unload is not None and unload["subtask_id"] in task["completed"]:
+            return None
+        return load.get("station")
+
+    def _conveyor_blocker(self, task, sub) -> Optional[str]:
+        """Why this load step may not put a part on the belt now, or None."""
+        station_id = sub.get("station")
+        for other in self._tasks.values():
+            if other is not task and other["state"] == "active" and self._part_on_belt(other) == station_id:
+                return f"task {other['task_id']} has a part on it"
+        station = self.registry.get(station_id) if station_id else None
+        if station is None:
+            return f"unknown QC station {station_id!r}"
+        if not self.registry.is_allocatable(station):
+            return f"QC station is {station.status}" + (f" ({station.status_reason})" if station.status_reason else
+                                                       " or not healthy")
+        return None
 
     def _drain_pending(self):
         if not self._pending:
@@ -393,7 +441,8 @@ class TaskScheduler:
             self._event("subtask_retry", task_id, subtask_id=sid, action=action,
                         robot_id=robot_id, reason=reason, attempt=sub["attempt"])
             if sub["group"] == "inspector":
-                self.registry.mark_idle(robot_id)  # may be re-allocated (possibly the other station)
+                # may be re-allocated (the other station, except at a conveyor: its own station only)
+                self.registry.mark_idle(robot_id)
             self._try_dispatch(task_id, sid)
             return
 
@@ -401,14 +450,12 @@ class TaskScheduler:
         if sub["group"] == "inspector":
             self.registry.set_status(robot_id, "error", f"QC failed: {reason}")
             carrier = task["carrier_robot"]
-            if carrier and not task["product_on_board"]:
-                # the part is on the QC conveyor, not on the robot: a human
-                # recovers it from the station, the empty carrier can work on
-                reason = f"{reason} (product left on the QC station at {sub['zone']})"
-            elif carrier:
+            if carrier and task["product_on_board"]:
                 self.registry.set_status(carrier, "error", f"holding product of failed task {task_id} at QC")
             self._fail_task(task, f"{action} failed: {reason}")
             if carrier and not task["product_on_board"]:
+                # the part is on the QC conveyor, not on the robot (_fail_task
+                # flagged the station): the empty carrier can work on
                 self.registry.mark_idle(carrier)
                 task["carrier_robot"] = None
             return
@@ -434,6 +481,13 @@ class TaskScheduler:
         self._fail_task(task, f"{action} failed: {reason}")
 
     def _fail_task(self, task, error: str, state: str = "failed"):
+        station = self._part_on_belt(task)
+        if station:
+            error = f"{error} (part may be on the conveyor of {station}: clear the belt, then reset_robot {station})"
+            st = self.registry.get(station)
+            if st is not None and st.status != "error":
+                self.registry.set_status(station, "error",
+                                         f"part of {state} task {task['task_id']} may be on the belt")
         task["state"] = state
         task["error"] = error
         task["finished_at"] = self._clock()
@@ -450,7 +504,8 @@ class TaskScheduler:
         """A terminal status/timeout arrived for a task that is already
         failed/cancelled. Decide whether the robot can go back to idle."""
         if sub["group"] == "inspector":
-            self.registry.mark_idle(robot_id)
+            if self._part_on_belt(task) != robot_id:   # else it stays in 'error' until the belt is cleared
+                self.registry.mark_idle(robot_id)
             return
         action = sub["action"]
         if action == "pick" and state == "done":
@@ -482,6 +537,7 @@ class TaskScheduler:
             return {"ok": False, "message": f"task {task_id} is already {task['state']}"}
         busy_robots = {inf["robot_id"] for inf in self._in_flight.values() if inf["task_id"] == task_id}
         carrier = task["carrier_robot"]
+        on_belt = self._part_on_belt(task)
         self._fail_task(task, "cancelled by operator", state="cancelled")
         # Robots with nothing in flight are released now; the rest when their
         # agent confirms the cancel (or the watchdog times them out).
@@ -491,7 +547,9 @@ class TaskScheduler:
             else:
                 self.registry.mark_idle(carrier)
             task["carrier_robot"] = None
-        return {"ok": True, "message": f"task {task_id} cancelled"}
+        note = f"; its part may be on the conveyor of {on_belt}: clear the belt, then reset_robot {on_belt}" \
+            if on_belt else ""
+        return {"ok": True, "message": f"task {task_id} cancelled{note}"}
 
     def _cmd_reset_robot(self, robot_id) -> Dict[str, Any]:
         robot = self.registry.get(robot_id) if isinstance(robot_id, str) else None

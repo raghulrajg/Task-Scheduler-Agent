@@ -116,6 +116,15 @@ SCANNER_COMMAND=                 # scanner PC only: the program that does one in
 ```
 `.env` is in `.gitignore`. Never commit it.
 
+**Updating an install made before `.env` was untracked.** Older versions of
+this repository tracked `.env`, so a plain `git pull` either deletes your
+`.env` or refuses to run. Keep a copy across the update:
+```bash
+cp .env /tmp/env.keep && git checkout -- .env && git pull && cp /tmp/env.keep .env && chmod 600 .env && rm /tmp/env.keep
+```
+The broker password that used to be committed is public: change it in EMQX,
+in every `.env` and in the Opta sketch.
+
 ### 3.2 Site and fleet (central server)
 - `site.json` lists the **locations** (the only names the LLM and the
   scheduler accept), plus timeouts, retries and the battery limit.
@@ -292,21 +301,44 @@ python3 launch.py agents agents/qc_01_conveyor.json
 The Opta does not answer requests and sends no request id, so the agent takes
 the **first verdict that arrives after the robot started putting this part
 on the belt** (the scheduler sends that time as `not_before`); each verdict is
-used once. No verdict within `timeout_s` (60 s) fails the inspection; an
-invalid camera message (`"valid": false`) is an **NG** verdict (the part
-goes to `fail_dest`), never a pass.
+used once. To make that safe:
+- **One part on the belt at a time.** A job's load step waits while another
+  job's part is on the belt, or while `qc_01` is not idle and healthy. The QC
+  step always goes to the conveyor's own station (`conveyor.station` in
+  `site.json`), never to another QC robot in the zone.
+- **Wait for the exit.** The Opta publishes the verdict while the part is at
+  the camera (S2) and only then runs it to S3, so the agent reports the
+  verdict `exit_travel_s` later (8 s; set it to your measured S2→S3 time plus
+  a margin). Only then is the unload pick sent to the arm.
+- **Fail closed.** No verdict within `timeout_s` (60 s) fails the inspection.
+  An invalid camera message (`"valid": false`) is an **NG** verdict (the part
+  goes to `fail_dest`), never a pass. A verdict that may belong to another part
+  fails the inspection as **ambiguous** instead of routing the part: when
+  two results arrive for one part, or when an earlier inspection never got
+  its verdict (e.g. the Opta was offline and still holds it in its send queue).
+- **A job that ends with its part on the belt** (QC failed, operator cancel,
+  failed load or unload) puts `qc_01` in `error`, and nothing is loaded until
+  a person has cleared the belt and run `tools/fleetctl.py reset qc_01`.
 
 On the Opta (deploy sketch, see the conveyor agent's README):
 - `MQTT_BROKER_IP` / `MQTT_USERNAME` / `MQTT_PASSWORD` must be **the same EMQX as
   `.env` here**, and `MQTT_TOPIC` must match `result_topic` in `agents/qc_01_conveyor.json`;
 - the deploy sketch for your camera mode must have `USE_MQTT = true`;
-- prefer `CAMERA_TRIGGER_MODE = TRIGGER_TCP` so the camera sends exactly one result per part.
+- prefer `CAMERA_TRIGGER_MODE = TRIGGER_TCP` so the camera sends exactly one result per part;
+- recommended sketch change: add `"age_ms"` (milliseconds since the result was
+  queued) to the published JSON. The agent then dates each verdict by when the
+  part was inspected, so a verdict sent late from the Opta's offline queue can
+  never be taken for a newer part. The agent works without it.
 
 The Dobot needs two more projects at the station (`agents/robot_01_arm.json`):
 `place_conveyor_entry` (put the part on the belt at S1) and `pick_conveyor_exit`
-(take it off at S3). If the arm cannot reach the exit from the same base
+(take it off at S3). `pick_conveyor_exit` should **wait until the part is at
+S3** before it reaches in (wire S3, or an Opta output that is on in `AT_EXIT`,
+to a Dobot DI and wait on it with a timeout), and must **check the grasp**, so
+an empty gripper is reported as a failure (`SetOutputInt(0, 2)`), never as done.
+If the arm cannot reach the exit from the same base
 pose, add a location for it in `site.json` and `stations.json` and set
-`"conveyor": {"exit_location": "<that location>"}`: the base then drives there
+`"conveyor": {"station": "qc_01", "exit_location": "<that location>"}`: the base then drives there
 before the pick. Inspecting in the gripper instead (no conveyor)? Remove
 `"conveyor"` from `quality_station` in `site.json`.
 
@@ -462,6 +494,7 @@ When a step must be dispatched:
    - it has every capability the step needs, on the right kind of subsystem
      (`pick`/`place` must be on a manipulator);
    - it may work in the step's zone (`"*"` = anywhere; QC stations only in their own zone);
+   - at a conveyor QC location: only the conveyor's own station (`conveyor.station`);
    - for the carrier: its base has **coordinates for every location of the
      job**, because it keeps the job until the final place.
 
@@ -469,7 +502,9 @@ When a step must be dispatched:
    `busy`, and releases the lock. Two jobs arriving at the same moment can
    never get the same robot.
 3. If nothing qualifies, the step joins a **FIFO waiting queue**, and a
-   `subtask_queued` event is published once. The queue is retried:
+   `subtask_queued` event (with the reason) is published once. A load onto a
+   conveyor also waits here while another job's part is on the belt or the
+   conveyor's station is not idle and healthy. The queue is retried:
    - after every robot result;
    - whenever a heartbeat changes whether a robot can take work (charged, e-stop released, came online, a location was taught);
    - every second by the watchdog.
@@ -536,10 +571,17 @@ The agent on the robot PC:
         as it arrives, with its arrival time (retained messages are ignored).
      2. Take the first unused verdict that arrived at or after the step's
         `not_before` (when the load step was dispatched, minus `clock_skew_s`),
-        waiting up to `timeout_s` for it. Each verdict is used once.
-     3. `result` `OK` → pass, `NG` → fail, `valid: false` → fail; anything else,
-        or nothing in time, is a **failed** inspection. The verdict's x, y,
-        theta and cycle are in the result and in the `qc_result` event.
+        waiting up to `timeout_s` for it. Each verdict is used once. With
+        `age_ms` in the message, "arrived" means "inspected".
+     3. Wait until `exit_travel_s` after the verdict arrived (the part travels
+        from the camera to the exit). A second result for the same part in the
+        meantime makes the verdict **ambiguous** (failed).
+     4. `result` `OK` → pass, `NG` → fail, `valid: false` → fail; anything else,
+        or nothing in time, is a **failed** inspection. If an earlier
+        inspection ended without its verdict and that verdict has not turned
+        up, the next verdict is **ambiguous** (failed), and so is the retry of
+        that part: a person checks it. The verdict's x, y, theta and cycle are
+        in the result and in the `qc_result` event.
    - **QC over MQTT (`mqtt_inspection`):**
      1. Publish `{"request_id": "<subtask>#<attempt>", "product", "station"}`
         on `qc/<station>/request`.
@@ -588,6 +630,10 @@ handles each state:
   - **QC station failure:** the station goes to `error` and the job is failed. The
     carrier goes to `error` if it holds the part; with a conveyor the part is on
     the belt, so the empty carrier is released and a human removes the part.
+  - **Any job that ends with its part possibly on a conveyor** (from the load
+    step until the unload pick is done: QC failure, cancel, failed load or
+    unload) puts the conveyor's station in `error`: no part is loaded until a
+    person has cleared the belt and run `fleetctl reset qc_01`.
   - **After the unload pick** a failed drive is never reassigned to another
     robot: the job is failed, as the part is no longer at the pick-up point.
 - **Operator cancel.** Steps in flight get a cancel message. The robot is
@@ -679,7 +725,7 @@ own WebSocket/HTTP API (`ws://<robot>:4000/nav`, `ws://<robot>:7000/status`,
 | `OLLAMA_HOST/PORT/MODEL`, `REQUIRE_CONFIRMATION` | `.env` | reasoning agent |
 | `RUN_MODE`, `MQTT_TOPIC_PREFIX` | env (set by `--test` / `launch.py`) | real or test; test prefix defaults to `sim/` |
 | `locations` | `site.json` | allowed location names (+ descriptions shown to the LLM) |
-| `locations.<qc>.conveyor` | `site.json` | QC on a conveyor: load/unload steps; `exit_location` if the exit needs another base pose |
+| `locations.<qc>.conveyor` | `site.json` | QC on a conveyor: `station` (its QC robot id, e.g. `qc_01`), `exit_location` if the exit needs another base pose |
 | `timeouts_s`, `max_retries`, `max_task_reassignments` | `site.json` | failure handling (8.7) |
 | `min_battery_percent`, `heartbeat_timeout_s`, `startup_grace_s` | `site.json` | allocation health gate, restart grace |
 | robots, subsystems, capabilities, zones | `robots_metadata.json` | fleet model |
@@ -711,7 +757,8 @@ own WebSocket/HTTP API (`ws://<robot>:4000/nav`, `ws://<robot>:7000/status`,
 | `namespaced` | `true` | add the run-mode prefix (`sim/` in TEST mode). `false` only to test with the real Opta |
 | `verdict_field`, `pass_values`, `fail_values` | `result`, `["OK"]`, `["NG"]` | what the Opta sends |
 | `invalid_is_fail` | `true` | `valid: false` = NG verdict (else a failed inspection) |
-| `timeout_s` | 60 | from the QC dispatch (keep below site.json `quality_check`, 90) |
+| `timeout_s` | 60 | from the QC dispatch |
+| `exit_travel_s` | 0 (8 in the shipped config) | measured S2→S3 travel + margin; the verdict is reported this long after it arrived. Keep `timeout_s + exit_travel_s` below site.json `quality_check` (90) |
 | `clock_skew_s`, `lookback_s` | 2, 30 | tolerance on `not_before`; window used when a step has none |
 | `announce` | `true` | publish `qc/<station>/request` when waiting |
 
@@ -740,6 +787,8 @@ Ready-made configs for other vendors are in `agents/examples/`: MiR and Universa
 | AMR: `cannot reach ONIX at ...` | the agent PC is not on the robot's network (TCP 4000/7000) |
 | QC: `no conveyor result on autonomous/product/Transformation within 60s` | is the Opta on the same broker (`MQTT_BROKER_IP` in the sketch vs `.env`), `USE_MQTT = true`, WiFi connected? Watch the topic: `mosquitto_sub -h <broker> -u <user> -P <pw> -t autonomous/product/Transformation -v` or the conveyor repo's `python/mqtt_monitor.py`. Conveyor in FAULT (Opta Serial Monitor `STATUS`)? |
 | conveyor part routed to waste with `reason: camera message was not x;y;theta;result` | the camera sent another format; check it with `SNIFF_ONLY` in the conveyor repo |
+| QC: `ambiguous conveyor verdict (...)` | a verdict may belong to another part (Opta was offline, two results for one part). Check the part by hand, clear the belt, `fleetctl reset qc_01`. Camera in continuous mode? Use `TRIGGER_TCP` |
+| job waits: `conveyor of qc_01 not free: ...` | another job's part is on the belt, or `qc_01` is in `error`/offline: after a failed or cancelled conveyor job, clear the belt and `fleetctl reset qc_01` |
 | arm: `no Dobot project configured for place at 'quality_station'` | add `place_conveyor_entry` / `pick_conveyor_exit` to `agents/robot_01_arm.json` (6.3) |
 | QC: `no result from the scanner ... (no scanner heartbeat)` | start `launch.py scanner qc_01` on the scanner PC; check `--test` matches |
 | QC: `scanner error: ...` | the inspection program failed or printed something other than PASS/FAIL/JSON |

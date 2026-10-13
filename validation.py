@@ -50,10 +50,11 @@ class SiteConfig:
             raise ValueError("site config must define a non-empty 'locations' object")
         for name, meta in locations.items():
             conv = meta.get("conveyor") if isinstance(meta, dict) else None
-            if conv in (None, False, True):
+            if conv is None or conv is False:
                 continue
-            if not isinstance(conv, dict):
-                raise ValueError(f"locations.{name}.conveyor must be true or an object")
+            if not isinstance(conv, dict) or not isinstance(conv.get("station"), str) or not conv["station"]:
+                raise ValueError(f"locations.{name}.conveyor must be an object naming its QC station, "
+                                 f"e.g. {{\"station\": \"qc_01\"}}")
             exit_loc = conv.get("exit_location")
             if exit_loc is not None and (exit_loc not in locations or exit_loc == name):
                 raise ValueError(f"locations.{name}.conveyor.exit_location {exit_loc!r} must be another "
@@ -78,13 +79,12 @@ class SiteConfig:
     def conveyor_for(self, location: str) -> Optional[Dict[str, Any]]:
         """The conveyor settings of a QC location, or None when the part is
         inspected while the robot holds it. With a conveyor, the carrier
-        places the part on the belt, the conveyor runs it past the camera,
-        and the carrier picks it up again at the exit (exit_location, or the
-        same location when that is null)."""
+        places the part on the belt, the conveyor's own QC station
+        ("station", a robot id) gives the verdict, and the carrier picks the
+        part up again at the exit (exit_location, or the same location when
+        that is null)."""
         conv = (self.locations.get(location) or {}).get("conveyor")
-        if conv is None or conv is False:
-            return None
-        return dict(conv) if isinstance(conv, dict) else {}
+        return dict(conv) if isinstance(conv, dict) else None
 
     def job_locations(self, instruction: Dict[str, Any]) -> List[str]:
         """Every location the carrier robot may drive to for this job."""

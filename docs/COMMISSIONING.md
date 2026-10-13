@@ -62,6 +62,9 @@ and the phases stay the same.
       sudo -u fleet cp .env.example .env && sudo -u fleet chmod 600 .env   # then edit
       sudo -u fleet venv/bin/python launch.py check                        # preflight
       ```
+      **Already installed from an older version** (when `.env` was still in git)?
+      Update without losing `.env`:
+      `cp .env /tmp/env.keep && git checkout -- .env && git pull && cp /tmp/env.keep .env && chmod 600 .env && rm /tmp/env.keep`
 
 ## 2. Simulated end-to-end (no hardware)
 
@@ -142,7 +145,12 @@ and the phases stay the same.
 2. Make one **project** per (action, location), e.g.
    `pick_manufacturing_1`, `place_conveyor_entry` (part onto the belt at S1),
    `pick_conveyor_exit` (part off the belt at S3), `place_package_area`,
-   `place_waste_area`.
+   `place_waste_area`. `pick_conveyor_exit` must **wait until the part is at
+   S3** before reaching in: wire S3 (or an Opta output that is on in
+   `AT_EXIT`) to a Dobot DI, wait on it with a timeout, and report failure
+   (`SetOutputInt(0, 2)`) if it never comes. The agent already holds the
+   verdict back by `exit_travel_s`, but the DI is what makes it safe against
+   a slow or jammed belt.
    Blockly projects are addressed as `blockly_<name>`. Each project must:
    - **re-localise first** (camera, marker or fixture), because the base never
      stops in exactly the same place;
@@ -212,11 +220,20 @@ and the phases stay the same.
       then put a part on the belt within 30 s (`lookback_s`) or while it waits:
       expect `done` with `pass: true` for a good part and `pass: false` for a bad one.
       With no part, it must end `failed` after `timeout_s`, never a pass.
-- [ ] Time the belt: from S1 to the verdict, and S1 to S3. The QC step's
-      `timeout_s` (60) must comfortably cover entry-to-verdict.
+- [ ] Time the belt: from S1 to the verdict, and from the verdict to the part
+      stopping at S3. Put the second time plus a margin in `exit_travel_s`
+      (`agents/qc_01_conveyor.json`, default 8 s). `timeout_s` (60) must
+      comfortably cover entry-to-verdict, and `timeout_s + exit_travel_s` must
+      stay below `quality_check` in `site.json` (90).
 - [ ] Teach the arm the two belt projects (phase 5) and check them with the base
       at `quality_station`: `--run place quality_station`, then
-      `--run pick quality_station` once the part is at S3.
+      `--run pick quality_station` once the part is at S3. Also run the pick
+      with the exit empty: it must come back `failed`, not `done`.
+- [ ] Recovery: cancel a job while its part is on the belt
+      (`tools/fleetctl.py cancel <task_id>`). Expect the reply to say the part
+      may be on the conveyor, `qc_01` in `error`, and the next job waiting with
+      `conveyor of qc_01 not free`. Clear the belt, `tools/fleetctl.py reset qc_01`,
+      and the next job loads.
 
 Using a camera PC with your own program instead (`agents/qc_01_scanner.json`):
 `SCANNER_COMMAND` in `.env`, `python3 launch.py scanner qc_01`, then
@@ -231,9 +248,12 @@ Using a camera PC with your own program instead (`agents/qc_01_scanner.json`):
 - [ ] `tools/fleetctl.py watch` in one terminal, `manual_runner.py` in another.
       Run 20 jobs with an operator at the e-stop. Include deliberate failures:
       remove the part before pick, block the path, unplug the QC camera (the
-      Opta faults with RESULT_TIMEOUT; the job fails with the part on the belt
-      and the empty robot is released), and cut the robot's Wi-Fi for 10 s while
-      it is driving.
+      Opta faults with RESULT_TIMEOUT; the job fails with the part on the belt,
+      the empty robot is released, `qc_01` goes to `error` until you clear the
+      belt and reset it), and cut the robot's Wi-Fi for 10 s while it is
+      driving. After the Opta itself was offline during a job, expect the next
+      conveyor job to fail as `ambiguous` unless the missing verdict arrived
+      first: check those parts by hand.
 - [ ] After each induced failure, confirm the robot shows `error` with a clear
       reason. Recover the product by hand, then run `tools/fleetctl.py reset
       robot_01`.

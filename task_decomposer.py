@@ -35,6 +35,7 @@ Each subtask:
     "group": "carrier",         # "carrier" | "inspector"
     "releases_robot": False,
     "handover": None,           # "load" / "unload" at a conveyor QC station, else None
+    "station": None,            # conveyor QC station (robot id) for load + quality_check steps
     "attempt": 1,               # bumped by the scheduler on each retry
 }
 
@@ -44,6 +45,8 @@ cannot be inspected in the gripper: the carrier places it on the belt
 and the carrier picks it up again at the belt exit ("unload") before
 driving to the success/fail destination. The carrier stays claimed the
 whole time, so the robot that loaded the part is the one that unloads it.
+The quality_check goes to the conveyor's own station (conveyor.station),
+never to another QC robot in the zone, which could not see the belt.
 
 Validation (known locations, QC zone reachable, types) happens BEFORE this
 in validation.validate_instruction -- this module assumes clean input.
@@ -79,7 +82,7 @@ def decompose_pick_qc_route(instruction: Dict[str, Any],
     subtasks = []
 
     def add(action, target, zone, requires, manipulator=None, branch=None,
-             group="carrier", releases_robot=False, subtask_id=None, handover=None):
+             group="carrier", releases_robot=False, subtask_id=None, handover=None, station=None):
         sid = subtask_id or f"{task_id}-{len(subtasks) + 1}"
         subtasks.append({
             "subtask_id": sid,
@@ -94,16 +97,18 @@ def decompose_pick_qc_route(instruction: Dict[str, Any],
             "group": group,
             "releases_robot": releases_robot,
             "handover": handover,
+            "station": station,
             "attempt": 1,
         })
 
     add("navigate", product, source, ["navigate"])
     add("pick", product, source, ["pick"], manipulator=True)
     add("navigate", product, qc_zone, ["navigate"])
+    station = conveyor.get("station") if conveyor is not None else None
     if conveyor is not None:
-        add("place", product, qc_zone, ["place"], manipulator=True, handover="load")
+        add("place", product, qc_zone, ["place"], manipulator=True, handover="load", station=station)
     add("quality_check", product, qc_zone, ["quality_check"],
-        group="inspector", releases_robot=True)
+        group="inspector", releases_robot=True, station=station)
     if conveyor is not None:
         exit_zone = conveyor.get("exit_location") or qc_zone
         if exit_zone != qc_zone:
