@@ -7,8 +7,22 @@ runs the part from the entry sensor S1 to the camera at S2, reads the
 camera's x;y;theta;result and publishes one MQTT message per part:
 
     autonomous/product/Transformation
-    {"x":12.500,"y":30.200,"theta":45.000,"result":"OK","valid":true,"cycle":5,"raw":"12.5;30.2;45.0;OK;"}
-    {"x":null,"y":null,"theta":null,"result":"NG","valid":false,"cycle":7,"raw":"garbage"}
+    {"x":12.500,"y":30.200,"theta":45.000,"result":"OK","valid":true,"cycle":5,"raw":"12.5;30.2;45.0;OK;",
+     "product":"ABCD","switch_ok":true}
+    {"x":null,"y":null,"theta":null,"result":"NG","valid":false,"cycle":7,"raw":"garbage","product":"ABCD",...}
+
+Multiple products: the camera has one program per product. For every part
+this driver publishes the part's product name on qc/<station>/request
+({"request_id", "product", ...}); the Opta (sketch 3.1+) needs it for every
+cycle, sends "switch <product>" to the camera once its entry sensor S1 has
+seen the part (never for a job cancelled before the part was on the belt)
+and waits 10 s for "ok" (at the latest before the part is inspected). It
+publishes its warnings (no "ok", no product name, ...) on
+autonomous/product/Warning; this driver logs them and forwards them to the
+operator on hmi/feedback ({"source": "conveyor", "warning", "detail", ...}).
+A result whose "product" is not this part's product fails the inspection
+(the camera ran another product's program); "switch_ok": false is passed
+on in the details as a warning.
 
 The Opta does not take requests and does not echo a request id: it simply
 publishes a verdict whenever a part passes the camera. So this driver
@@ -62,7 +76,10 @@ Config (agents/qc_01_conveyor.json):
   "exit_travel_s": 8,        # measured S2 -> S3 travel + margin: wait this long after the verdict
   "lookback_s": 30,          # used only when the QC step has no not_before
   "clock_skew_s": 2,         # tolerance on not_before (scheduler and agent clocks, NTP)
-  "announce": true           # also publish qc/<station>/request (for dashboards and tools/conveyor_sim.py)
+  "announce": true,          # publish qc/<station>/request: the Opta takes the product name from it (required
+                             # by the multi-product sketch), also used by dashboards and tools/conveyor_sim.py
+  "warning_topic": "autonomous/product/Warning",   # MQTT_WARNING_TOPIC in the Opta sketch ("" = off)
+  "forward_warnings": true   # pass the Opta's warnings to the operator on hmi/feedback
 }
 Keep timeout_s + exit_travel_s below site.json timeouts_s.quality_check (90).
 """
@@ -81,6 +98,7 @@ from drivers.util import dig, matches
 logger = logging.getLogger("driver.conveyor")
 
 DEFAULT_TOPIC = "autonomous/product/Transformation"
+DEFAULT_WARNING_TOPIC = "autonomous/product/Warning"
 BUFFER_S = 600          # forget results older than this
 BUFFER_MAX = 200
 DUPLICATE_S = 5.0       # same cycle + raw within this window = a duplicate delivery
@@ -100,6 +118,11 @@ class ConveyorInspectionDriver(Driver):
         raw_topic = cfg.get("result_topic") or DEFAULT_TOPIC
         self.result_topic = config.topic(raw_topic) if cfg.get("namespaced", True) else raw_topic
         self.request_topic = config.topic(f"qc/{self.station}/request") if cfg.get("announce", True) else None
+        raw_warning = cfg.get("warning_topic", DEFAULT_WARNING_TOPIC)
+        self.warning_topic = ((config.topic(raw_warning) if cfg.get("namespaced", True) else raw_warning)
+                              if raw_warning else None)
+        self.feedback_topic = config.topic(config.HMI_FEEDBACK_TOPIC) if cfg.get("forward_warnings", True) else None
+        self._last_warning: Optional[Dict[str, Any]] = None
         self._field = cfg.get("verdict_field", "result")
         self._pass_values = cfg.get("pass_values", ["OK"])
         self._fail_values = cfg.get("fail_values", ["NG"])
@@ -133,7 +156,10 @@ class ConveyorInspectionDriver(Driver):
             logger.error("conveyor link: MQTT connect refused: %s", reason_code)
             return
         self.connected = True
-        client.subscribe([(self.result_topic, 1), (self.event_topic, 1)])
+        subs = [(self.result_topic, 1), (self.event_topic, 1)]
+        if self.warning_topic:
+            subs.append((self.warning_topic, 1))
+        client.subscribe(subs)
         logger.info("listening for conveyor results on %s", self.result_topic)
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):
@@ -151,6 +177,14 @@ class ConveyorInspectionDriver(Driver):
             return
         if msg.retain:
             logger.info("ignoring retained (old) message on %s", msg.topic)
+            return
+        if self.warning_topic and msg.topic == self.warning_topic:
+            try:
+                warning = json.loads(msg.payload.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                warning = {"warning": "UNKNOWN", "detail": msg.payload.decode("utf-8", "replace")[:200]}
+            if isinstance(warning, dict):
+                self.on_warning(warning)
             return
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
@@ -184,6 +218,19 @@ class ConveyorInspectionDriver(Driver):
             self._cond.notify_all()
         logger.info("conveyor result #%d: %s", entry["seq"], payload)
         return True
+
+    def on_warning(self, warning: Dict[str, Any]) -> None:
+        """A warning from the Opta (e.g. SWITCH_NO_ACK: the camera did not confirm the
+        product's program). Logged, and shown to the operator on hmi/feedback."""
+        with self._cond:
+            self._last_warning = dict(warning, received_at=self._clock())
+        logger.warning("conveyor %s warning %s (product %s): %s", self.station, warning.get("warning"),
+                       warning.get("product"), warning.get("detail"))
+        if self.feedback_topic and self.connected:
+            feedback = {"request_id": None, "ok": False, "source": "conveyor", "station": self.station,
+                        "warning": warning.get("warning"), "product": warning.get("product"),
+                        "detail": warning.get("detail"), "ts": time.time()}
+            self._client.publish(self.feedback_topic, json.dumps(feedback), qos=1)
 
     def reset(self) -> None:
         """The operator cleared the belt and reset the station: forget verdicts
@@ -301,6 +348,14 @@ class ConveyorInspectionDriver(Driver):
             if remaining <= 0:
                 break
             cancel.wait(min(0.2, remaining))
+        product = entry["payload"].get("product")
+        target = subtask.get("target")
+        if isinstance(product, str) and isinstance(target, str) and product != target:
+            with self._cond:
+                self._remember(self._ambiguous, sid, True)
+            logger.error("QC %s: the conveyor inspected product %r, this part is %r", rid, product, target)
+            return failed(f"the camera ran the program of product {product!r} but this part is {target!r}: "
+                          f"check this part by hand (it is not routed on that verdict)")
         return self._verdict(entry, start)
 
     def _verdict(self, entry: Dict[str, Any], start: float) -> Dict[str, Any]:
@@ -308,6 +363,12 @@ class ConveyorInspectionDriver(Driver):
         details = {k: p.get(k) for k in ("x", "y", "theta", "result", "valid", "cycle", "raw")}
         details["received_at"] = entry["arrived"]
         details["waited_s"] = round(max(0.0, entry["arrived"] - start), 2)
+        if "product" in p:
+            details["product"] = p.get("product")
+            details["switch_ok"] = p.get("switch_ok")
+            if p.get("switch_ok") is False:
+                details["warning"] = (f"the camera did not confirm the switch to the program of "
+                                      f"{p.get('product')!r} (no 'ok' within 10 s)")
         if p.get("valid") is False:
             if self._invalid_is_fail:
                 details["reason"] = "camera message was not x;y;theta;result -- treated as NG"
@@ -335,6 +396,11 @@ class ConveyorInspectionDriver(Driver):
                       f"{self._clock() - last['arrived']:.0f}s ago")
         if owed:
             detail += f"; verdict still missing for {owed} (the next one is treated as ambiguous)"
+        with self._cond:
+            w = self._last_warning
+        if w is not None and self._clock() - w["received_at"] < 600:
+            detail += (f"; last warning {w.get('warning')} (product {w.get('product')}) "
+                       f"{self._clock() - w['received_at']:.0f}s ago")
         return robot_state(True, detail)
 
     def close(self) -> None:

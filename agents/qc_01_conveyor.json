@@ -1,5 +1,5 @@
 {
-  "_comment": "QC station qc_01 = the conveyor agent (Arduino Opta + Hikrobot SC3000, github.com/raghulrajg/conveyor_agent). The Opta publishes one verdict per part on autonomous/product/Transformation; this agent turns the first verdict after the robot loaded the part into the QC result. Run it on the central server: python3 launch.py agents agents/qc_01_conveyor.json (systemd: robot-fleet-agent@qc_01_conveyor). Run only ONE qc_01_* agent at a time (this one, qc_01_scanner.json or qc_01_stand_in.json). The Opta sketch's MQTT_BROKER_IP / MQTT_TOPIC must match .env and result_topic. exit_travel_s: the Opta publishes the verdict while the part is still at the camera (S2); the verdict is reported this many seconds later so the unload pick finds the part at the exit S3 -- set it to the measured S2->S3 travel time plus a margin (timeout_s + exit_travel_s must stay below site.json quality_check, 90).",
+  "_comment": "QC station qc_01 = the conveyor agent (Arduino Opta + Hikrobot SC3000, github.com/raghulrajg/conveyor_agent). The Opta publishes one verdict per part on autonomous/product/Transformation; this agent turns the first verdict after the robot loaded the part into the QC result. Run it on the central server: python3 launch.py agents agents/qc_01_conveyor.json (systemd: robot-fleet-agent@qc_01_conveyor). Run only ONE qc_01_* agent at a time (this one, qc_01_scanner.json or qc_01_stand_in.json). The Opta sketch's MQTT_BROKER_IP / MQTT_TOPIC must match .env and result_topic. exit_travel_s: the Opta publishes the verdict while the part is still at the camera (S2); the verdict is reported this many seconds later so the unload pick finds the part at the exit S3 -- set it to the measured S2->S3 travel time plus a margin (timeout_s + exit_travel_s must stay below site.json quality_check, 90). Multiple products: keep announce = true, the Opta takes each part's product name from qc/qc_01/request (MQTT_PRODUCT_TOPIC in the sketch) and switches the camera program; its warnings (warning_topic = MQTT_WARNING_TOPIC) are forwarded to the operator on hmi/feedback.",
   "robot_id": "qc_01",
   "subsystem": "scanner",
   "heartbeat_s": 5,
@@ -16,6 +16,8 @@
     "exit_travel_s": 8,
     "lookback_s": 30,
     "clock_skew_s": 2,
-    "announce": true
+    "announce": true,
+    "warning_topic": "autonomous/product/Warning",
+    "forward_warnings": true
   }
 }

@@ -294,8 +294,21 @@ The QC station `qc_01` is the [conveyor agent](https://github.com/raghulrajg/con
 an Arduino Opta runs the belt (sensors S1 entry, S2 camera, S3 exit) and
 publishes the camera verdict for every part on `autonomous/product/Transformation`:
 ```json
-{"x":12.500,"y":30.200,"theta":45.000,"result":"OK","valid":true,"cycle":5,"raw":"12.5;30.2;45.0;OK;"}
+{"x":12.500,"y":30.200,"theta":45.000,"result":"OK","valid":true,"cycle":5,"raw":"12.5;30.2;45.0;OK;","product":"ABCD","switch_ok":true}
 ```
+
+**Multiple products.** The camera has one program per product. For every part
+the QC agent publishes the part's product name (the one in the operator's
+message, e.g. "take **ABCD** from manufacturing_1 ...") on `qc/qc_01/request`.
+The Opta needs it for **every** cycle: once S1 has detected the part it sends
+`switch ABCD` to the camera over TCP and waits 10 s for `ok`, so the program
+is normally loaded before the part reaches the camera. A job cancelled before
+its part is on the belt never switches the camera. Without
+`ok` it warns and carries on (`"switch_ok": false`); without a product name
+for 30 s it faults (`NO_PRODUCT`). The Opta's warnings
+(`autonomous/product/Warning`) are logged by the QC agent and forwarded to the
+operator on `hmi/feedback`. A verdict for a different product than the part's
+fails the inspection (the part is checked by hand).
 Because the part rides the belt, `site.json` marks `quality_station` as a
 conveyor, and a job runs like this at the station (8.3):
 ```
@@ -335,6 +348,10 @@ used once. To make that safe:
 On the Opta (deploy sketch, see the conveyor agent's README):
 - `MQTT_BROKER_IP` / `MQTT_USERNAME` / `MQTT_PASSWORD` must be **the same EMQX as
   `.env` here**, and `MQTT_TOPIC` must match `result_topic` in `agents/qc_01_conveyor.json`;
+- `MQTT_PRODUCT_TOPIC` must be `qc/qc_01/request` (the QC agent's request, keep
+  `announce: true`) and `MQTT_WARNING_TOPIC` must match `warning_topic`;
+- each camera program is named exactly like the product, and SCMVS answers
+  `ok` to `switch <program>`;
 - the deploy sketch for your camera mode must have `USE_MQTT = true`;
 - prefer `CAMERA_TRIGGER_MODE = TRIGGER_TCP` so the camera sends exactly one result per part;
 - recommended sketch change: add `"age_ms"` (milliseconds since the result was
@@ -588,7 +605,11 @@ The agent on the robot PC:
      3. Wait until `exit_travel_s` after the verdict arrived (the part travels
         from the camera to the exit). A second result for the same part in the
         meantime makes the verdict **ambiguous** (failed).
-     4. `result` `OK` → pass, `NG` → fail, `valid: false` → fail; anything else,
+     4. A verdict whose `product` is not the part's product is a **failed**
+        inspection (and so is the retry): the camera ran another product's program.
+        `switch_ok: false` (the camera did not confirm the program) is kept as a
+        warning in the result details.
+     5. `result` `OK` → pass, `NG` → fail, `valid: false` → fail; anything else,
         or nothing in time, is a **failed** inspection. If an earlier
         inspection ended without its verdict and that verdict has not turned
         up, the next verdict is **ambiguous** (failed), and so is the retry of
@@ -710,6 +731,7 @@ In TEST mode, prefix every topic with `sim/`.
 |---|---|---|
 | `hmi/user_prompt` | HMI → reasoning agent | text, or `{"prompt", "request_id"}` |
 | `hmi/feedback` | reasoning agent → HMI | `{request_id, ok, instruction?, needs_confirmation?, forwarded?, error?}` |
+| `hmi/feedback` | conveyor QC agent → HMI | `{request_id: null, ok: false, source: "conveyor", station, warning, product, detail, ts}` |
 | `hmi/confirm` | HMI → reasoning agent | `{"request_id", "confirm": true/false}` |
 | `scheduler/instructions` | HMI/LLM → scheduler | `{product, source, quality_check, success_dest, fail_dest, request_id?}` |
 | `scheduler/commands` | operator → scheduler | `{"cmd": "cancel_task"/"reset_robot"/"set_maintenance"/"status", ...}` |
@@ -721,10 +743,12 @@ In TEST mode, prefix every topic with `sim/`.
 | `qc/<station>/request` | QC agent → scanner | `{request_id: "<subtask_id>#<attempt>", subtask_id, product, station, ts}` |
 | `qc/<station>/result` | scanner → QC agent | `{request_id, pass: true/false, details?}` or `{request_id, error}` |
 | `qc/<station>/status` | scanner → all (retained, + last will) | `{online, detail, mode, ts}` every 5 s |
-| `autonomous/product/Transformation` | conveyor (Opta) → QC agent | `{x, y, theta, result: "OK"/"NG", valid, cycle, raw}`, QoS 0, one per part |
+| `autonomous/product/Transformation` | conveyor (Opta) → QC agent | `{x, y, theta, result: "OK"/"NG", valid, cycle, raw, product, switch_ok}`, QoS 0, one per part |
+| `autonomous/product/Warning` | conveyor (Opta) → QC agent | `{warning: "SWITCH_NO_ACK"/"NO_PRODUCT"/"PRODUCT_REJECTED"/"PRODUCT_STALE", product, cycle, state, detail}` |
 
 With the conveyor, the QC agent also publishes `qc/<station>/request` when it starts
-waiting (for dashboards and `tools/conveyor_sim.py`; the Opta does not read it).
+waiting. The Opta takes the part's product name from it and switches the camera
+program; dashboards and `tools/conveyor_sim.py` read it too.
 
 The ONIX robot itself is not on MQTT: the `amr` agent talks to it over its
 own WebSocket/HTTP API (`ws://<robot>:4000/nav`, `ws://<robot>:7000/status`,
@@ -772,7 +796,9 @@ own WebSocket/HTTP API (`ws://<robot>:4000/nav`, `ws://<robot>:7000/status`,
 | `timeout_s` | 60 | from the QC dispatch |
 | `exit_travel_s` | 0 (8 in the shipped config) | measured S2→S3 travel + margin; the verdict is reported this long after it arrived. Keep `timeout_s + exit_travel_s` below site.json `quality_check` (90) |
 | `clock_skew_s`, `lookback_s` | 2, 30 | tolerance on `not_before`; window used when a step has none |
-| `announce` | `true` | publish `qc/<station>/request` when waiting |
+| `announce` | `true` | publish `qc/<station>/request` when waiting. **Keep `true`:** the Opta takes each part's product name from it |
+| `warning_topic` | `autonomous/product/Warning` | `MQTT_WARNING_TOPIC` in the Opta sketch (`""` = off) |
+| `forward_warnings` | `true` | forward the Opta's warnings to the operator on `hmi/feedback` |
 
 **`mqtt_inspection` driver** (`agents/qc_01_scanner.json`): `station`,
 `timeout_s` (30), `health_timeout_s` (20; scanner heartbeat age),
