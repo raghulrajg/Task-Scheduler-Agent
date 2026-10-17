@@ -99,9 +99,43 @@ double-claims, nothing dropped.
 | `manual_runner.py` | For manual testing — submits one instruction you supply directly (file or default), instead of waiting on the instruction topic. |
 | `robot_agent.py` | **Robot-side** agent — runs on each subsystem's controller, subscribes to its task topic, and publishes the status ack once `execute_task()` finishes. `execute_task()` is ported from your `manipulator_control_node.py` (navigate/gripper/QC-simulate), split per action so it fits the decomposed-subtask model instead of one node running the whole job. This is what closes the loop end to end. |
 | `test_scheduler_offline.py` | Single-task walkthrough + concurrency stress test, no broker needed. |
+| `manipulator/` | Arm kinematics: DH forward kinematics (flange / tool tip / camera), Dobot servo mapping, camera detection to object pose in the base frame, analytic tool-tip IK that rejects any solution below the table, and a top-down pick planner. |
+| `test_manipulator_offline.py` | FK/IK round trip, below-table rejection, object pose and pick plan checks, no robot needed. |
 | `requirements.txt` | `paho-mqtt`, `python-dotenv`. |
 | `deploy/task-scheduler.service` | systemd unit for the scheduler process, auto-restart on failure. |
 | `deploy/robot-agent-example.service` | systemd unit template for one robot subsystem's agent — copy per subsystem. |
+
+## Manipulator kinematics
+
+```python
+from manipulator import base_T_object, camera_T_object_from_rvec_tvec, plan_pick, solve_ik
+
+servo_now = [...]                      # Dobot servo angles [deg] when the image was taken
+cam_T_obj = camera_T_object_from_rvec_tvec(rvec, tvec)   # ArUco / solvePnP, meters
+T_obj = base_T_object(servo_now, cam_T_obj)               # object in the robot base frame
+plan = plan_pick(T_obj, servo_now, table_z=TABLE_Z)       # pre_grasp / grasp / lift servo angles
+```
+
+- **Object pose.** `T_base_object = T_base_camera(q) @ T_camera_object`, with
+  `T_base_camera` from the camera DH chain at the angles the arm had when
+  the image was taken, so the observation pose does not need to be home.
+  `object_T_base()` gives the inverse. If detections come out rotated about
+  the view axis, set `perception.T_CAMERA_DH_TO_OPTICAL`.
+- **Table plane.** The table is horizontal, so its height in the base frame
+  does not depend on the base joint angle. Pass `table_z` (measured once), or
+  leave it `None` and `plan_pick` takes the detected object frame origin as
+  lying on the table (true for a marker printed flat on the table).
+- **IK.** Closed form, up to 8 solutions (shoulder x wrist x elbow), each
+  verified with FK. A solution is kept only if the tool tip stays at least
+  `TIP_CLEARANCE` (5 mm) and every joint / link end of the flange, tool and
+  camera chains at least `LINK_CLEARANCE` (40 mm) above the table, and all
+  servo angles are inside `JOINT_LIMITS_SERVO_DEG` (edit to your real limits
+  in `manipulator/ik.py`). The pick planner checks every waypoint of the
+  straight-down approach and lift, not just the grasp.
+- **Tooltip model.** As in `tooltip_transformation.py`, the 76.5 mm tool
+  offset sits in d5 (it does not turn with joint 6). That matches a tool
+  fixed to link 5; if the tool is bolted to the flange it is exact only
+  while joint 6 is at its home angle.
 
 ## Deploying for real
 
